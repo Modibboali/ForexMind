@@ -1,0 +1,21 @@
+# Raw historical data is large and immutable; do not commit it.
+data/raw/
+# Generated processed data can be regenerated via tools/process_data.py
+data/processed/
+# Dataset inspection reports are generated artifacts.
+data/reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+forex_env/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
