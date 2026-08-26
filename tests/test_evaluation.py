@@ -219,6 +219,29 @@ def test_per_period_report() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Report config round-trip (guards evaluate_run --config)
+# ---------------------------------------------------------------------------
+
+
+def test_report_config_roundtrip() -> None:
+    from forexmind.evaluation.report import env_config_to_dict
+    from tools.common import encoder_config_from_dict, environment_config_from_dict
+
+    env = default_config(initial_balance="10000", leverage=50, spread_value=0.0002,
+                         sizing_mode="equity_fraction")
+    env2 = environment_config_from_dict(env_config_to_dict(env))
+    assert env2.margin.initial_balance == env.margin.initial_balance
+    assert env2.execution.spread_value == env.execution.spread_value
+    assert env2.sizing.mode == env.sizing.mode
+
+    enc = EncoderConfig(context_length=16, initial_balance="10000")
+    enc2 = encoder_config_from_dict(enc.to_dict())
+    assert enc2.context_length == 16
+    assert enc2.market_features == enc.market_features
+    assert enc2.normalizer.market == enc.normalizer.market
+
+
+# ---------------------------------------------------------------------------
 # Runner end-to-end
 # ---------------------------------------------------------------------------
 

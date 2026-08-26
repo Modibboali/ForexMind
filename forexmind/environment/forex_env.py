@@ -85,9 +85,9 @@ class ForexEnvironment:
         self._m5_ts: np.ndarray | None = None
         self._minutes_since_last: np.ndarray | None = None
         self._is_weekend_gap: np.ndarray | None = None
-        self._timeline_cache: tuple[
-            pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray
-        ] | None = None
+        self._timeline_cache: (
+            tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None
+        ) = None
         self._obs_idx = 0
         self._start_index = 0
         self._horizon_steps = 0

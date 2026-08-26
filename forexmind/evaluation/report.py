@@ -75,6 +75,17 @@ def env_config_to_dict(config: EnvironmentConfig) -> dict[str, object]:
     }
 
 
+def _pooled_periods(
+    trajectories: list[Trajectory], periods_per_year: float
+) -> dict[str, dict[str, object]]:
+    """Per-period metrics pooled over all (timestamp, log-return) steps."""
+    if not trajectories:
+        return {}
+    ts = np.concatenate([t.timestamps for t in trajectories])
+    lr = np.concatenate([t.log_returns for t in trajectories])
+    return per_period_report(ts, lr, periods_per_year)
+
+
 def _agent_report(
     evaluation: AgentEvaluation,
     *,
@@ -85,20 +96,22 @@ def _agent_report(
     periods_per_year: float,
 ) -> dict[str, Any]:
     grouped = evaluation.trajectories_by_instrument
-    per_instrument: dict[str, dict[str, object]] = {}
+    per_instrument: dict[str, dict[str, Any]] = {}
+    all_trajs: list[Trajectory] = []
     for instr, trajs in grouped.items():
-        timestamps, mean_log, n_ep = _mean_series(trajs)
+        all_trajs.extend(trajs)
+        _ts, mean_log, n_ep = _mean_series(trajs)
         metrics = compute_series_metrics(mean_log, periods_per_year)
         per_instrument[instr] = {
             "n_episodes": n_ep,
             "metrics": _floatify(metrics),
-            "periods": per_period_report(timestamps, mean_log, periods_per_year),
+            "periods": _pooled_periods(trajs, periods_per_year),
         }
 
-    agg_ts, agg_log, _ = aggregate_across_instruments(grouped)
+    _agg_ts, agg_log, _ = aggregate_across_instruments(grouped)
     aggregate = {
         "metrics": _floatify(compute_series_metrics(agg_log, periods_per_year)),
-        "periods": per_period_report(agg_ts, agg_log, periods_per_year),
+        "periods": _pooled_periods(all_trajs, periods_per_year),
     }
 
     agent_cfg = _floatify(getattr(evaluation.config, "to_dict", lambda: {})())
