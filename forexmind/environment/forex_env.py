@@ -85,6 +85,9 @@ class ForexEnvironment:
         self._m5_ts: np.ndarray | None = None
         self._minutes_since_last: np.ndarray | None = None
         self._is_weekend_gap: np.ndarray | None = None
+        self._timeline_cache: tuple[
+            pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+        ] | None = None
         self._obs_idx = 0
         self._start_index = 0
         self._horizon_steps = 0
@@ -295,7 +298,22 @@ class ForexEnvironment:
         )
 
     def _precompute_timeline(self) -> None:
+        """Precompute the execution index map and gap metadata.
+
+        The result depends only on the instrument's M1/M5 frames, so it is
+        cached per frame identity and reused across resets (safe because the
+        cached frame reference is identity-checked).
+        """
         assert self._m1 is not None and self._m5 is not None
+        if self._timeline_cache is not None:
+            cached_m5, cached_m1, exec_idx, m5_ts, minutes, weekend = self._timeline_cache
+            if cached_m5 is self._m5 and cached_m1 is self._m1:
+                self._exec_m1_idx = exec_idx
+                self._m5_ts = m5_ts
+                self._minutes_since_last = minutes
+                self._is_weekend_gap = weekend
+                return
+
         m1_ts = self._m1[TIMESTAMP].to_numpy(dtype="datetime64[ns]")
         m5_ts = self._m5[TIMESTAMP].to_numpy(dtype="datetime64[ns]")
         interval = np.timedelta64(self.config.decision_interval_minutes, "m")
@@ -316,6 +334,14 @@ class ForexEnvironment:
             weekend[1:] = ((prev_dow >= 4) & (prev_dow <= 5)) & ((cur_dow == 6) | (cur_dow == 0))
         self._minutes_since_last = minutes
         self._is_weekend_gap = weekend
+        self._timeline_cache = (
+            self._m5,
+            self._m1,
+            self._exec_m1_idx,
+            self._m5_ts,
+            self._minutes_since_last,
+            self._is_weekend_gap,
+        )
 
     def _target_units(self, action: Action, exec_mid: Decimal) -> Decimal:
         assert self._portfolio is not None
@@ -375,15 +401,21 @@ class ForexEnvironment:
 
         window = self.config.observation_window
         start = max(0, obs_idx - window + 1)
+        sub = self._m5.iloc[start : obs_idx + 1]
+        t = sub[TIMESTAMP].to_numpy(dtype="datetime64[ns]")
+        o = sub[OPEN].to_numpy(dtype="float64")
+        h = sub[HIGH].to_numpy(dtype="float64")
+        lo = sub[LOW].to_numpy(dtype="float64")
+        cl = sub[CLOSE].to_numpy(dtype="float64")
         bars = tuple(
             MarketBar(
-                timestamp=pd.Timestamp(row[TIMESTAMP]),
-                open=float(row[OPEN]),
-                high=float(row[HIGH]),
-                low=float(row[LOW]),
-                close=float(row[CLOSE]),
+                timestamp=pd.Timestamp(t[i]),
+                open=float(o[i]),
+                high=float(h[i]),
+                low=float(lo[i]),
+                close=float(cl[i]),
             )
-            for _, row in self._m5.iloc[start : obs_idx + 1].iterrows()
+            for i in range(len(t))
         )
 
         assert self._m5_ts is not None

@@ -1,14 +1,20 @@
-# ForexMind — Phase 1
+# ForexMind — Phases 1 & 2
 
-A research-grade, **deterministic** Forex market/data environment for
-reinforcement-learning research. Phase 1 builds the reliable foundation that
-later agents (SAC, PPO, Dreamer, MuZero, Stochastic MuZero, offline RL) will
-consume: a canonical M1 data layer, dataset validation, deterministic M1→M5
-resampling, an instrument-aware dataset, an execution-cost model, portfolio /
-margin accounting, and a Gymnasium-style environment.
+A research-grade, **deterministic** Forex market/data environment and learning
+protocol for reinforcement-learning research.
 
-> Phase 1 deliberately contains **no** neural networks, no RL algorithms, no
-> MCTS, no technical-indicator features, no live trading. It is a simulator.
+- **Phase 1** builds the reliable foundation later agents (SAC, PPO, Dreamer,
+  MuZero, Stochastic MuZero, offline RL) will consume: a canonical M1 data
+  layer, dataset validation, deterministic M1→M5 resampling, an
+  instrument-aware dataset, an execution-cost model, portfolio / margin
+  accounting, and a Gymnasium-style environment.
+- **Phase 2** adds the leakage-free learning/evaluation layer: temporal
+  train/validation/test splits, a causal observation encoder, a deterministic
+  episode sampler, baseline strategies, and a full evaluation framework.
+
+> Phases 1-2 deliberately contain **no** neural networks, no RL algorithms, no
+> MCTS, no technical-indicator feature libraries, no live trading. They build
+> the deterministic simulator and evaluation protocol that later phases reuse.
 
 ---
 
@@ -363,6 +369,189 @@ periods (by design).
 
 ## 14. Next milestone
 
-Phase 2: observation encoder + RL training loop (SAC/PPO baselines), or the
-MuZero/Dreamer planning stack. The simulator stays agent-agnostic: market data,
-environment, execution, portfolio, reward, and agent remain separate layers.
+Phase 3: model-free RL baselines (SAC, PPO) with a training loop, replay and
+checkpointing, experiment tracking, and validation-based model selection. The
+simulator, observation pipeline, episode sampler, and evaluation framework stay
+agent-agnostic and reusable by those algorithms.
+
+---
+
+# ForexMind — Phase 2 (Learning & Evaluation Layer)
+
+Phase 2 adds the leakage-free learning/evaluation protocol on top of the Phase 1
+simulator: temporal splits, a causal observation encoder, a deterministic
+episode sampler, baseline strategies, and a full evaluation framework. **No
+neural networks / RL algorithms / MCTS are implemented here.**
+
+## 15. Learning protocol
+
+### Temporal splits (`forexmind/data/splits.py`)
+
+Splits are strictly chronological and never random, applied independently to
+every instrument (exact timestamps, half-open `[start, end)`):
+
+| Split      | Period          |
+| ---------- | --------------- |
+| TRAIN      | 2006-01-01 .. 2019-01-01 |
+| VALIDATION | 2019-01-01 .. 2022-01-01 |
+| TEST       | 2022-01-01 .. 2026-01-01 |
+
+The `SplitDataset` enforces `max(train_ts) < min(validation_ts) < min(test_ts)`
+for every instrument, verifies non-empty splits, and produces a machine-readable
+manifest. `SplitConfig` is serializable.
+
+### Context window (`forexmind/observation/window.py`)
+
+`context_length = 64` by default. The window is exactly
+`[current_index - context_length + 1, current_index]` — **no future rows** —
+plus a `prior_close` (the bar before the window) so the first bar's return
+features are defined. Policies:
+
+- `strict_split` (default): the window **and** `prior_close` must come from the
+  same split → zero cross-split contamination.
+- `historical_warmup`: pre-split bars may be used as context; the episode
+  itself stays in-split.
+
+An invalid context raises `WindowError` (never silently padded with future
+data).
+
+### Observation representation (`forexmind/observation/`)
+
+`EncodedObservation` is structured (not a raw dict):
+
+| Field            | Shape      | Content |
+| ---------------- | ---------- | ------- |
+| `market`         | (64, 5)    | open/high/low/close/log returns vs. previous close |
+| `account`        | (10,)      | normalized account state (below) |
+| `time`           | (14,)      | cyclic hour/min/dow, minutes-since-bar, weekend flag, session one-hot |
+| `instrument_vec` | (7,)       | deterministic one-hot instrument identity |
+| `closes`         | (64,)      | raw closes (causal baselines / analysis; not the model input) |
+| `prior_close`    | scalar     | close immediately before the window |
+
+The flat `encoded` concatenation (shape `(351,)`) is the model-facing input.
+Instrument order is the fixed canonical order
+`EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD, USDCAD, NZDUSD` (a learned embedding
+can replace one-hot later without changing the environment).
+
+Account features (normalized by initial balance / equity): `position_exposure`,
+`position_units_normalized`, `entry_distance`, `unrealized_pnl_normalized`,
+`realized_pnl_normalized`, `equity_return_from_initial`, `drawdown_normalized`,
+`margin_utilization`, `free_margin_ratio`, `leverage_used`.
+
+### Normalization (`forexmind/observation/normalization.py`)
+
+No fitted statistics are used in Phase 2 (returns / ratios / relative prices
+are inherently local and scale-independent), so **normalization leakage is
+impossible**. A `Normalizer` abstraction (`identity` / `standard`) exists for
+future features that need fitted statistics, with the hard rule
+`fit(train) -> transform(train/validation/test)` — never fit on validation or
+test.
+
+### Episode sampling (`forexmind/episodes/`)
+
+`EpisodeSampler(dataset, EpisodeConfig(split, horizon, context_length, seed))`
+returns reproducible `EpisodeSpec`s:
+
+- instruments sampled **uniformly** (EURUSD does not dominate by row count);
+- valid starts sampled uniformly among starts that fit context + horizon inside
+  the split;
+- gap-aware: `GapPolicy(allow_cross_weekend=True, max_bar_gap_minutes=None)` by
+  default — weekends may be crossed (the gap stays explicit in time features)
+  and oversized gaps can be configured to invalidate starts;
+- episodes never leave their split and never observe future data.
+
+The sampler only *chooses* episodes; `ForexEnvironment` executes them (no
+second simulation engine). Stratification by year/volatility/session is a
+documented extension point.
+
+## 16. Baselines (`forexmind/baselines/`)
+
+All baselines implement `TradingAgent` (`reset(seed)`, `act(observation)`) and
+only ever read the causal `EncodedObservation`:
+
+| Agent             | Definition |
+| ----------------- | ---------- |
+| `flat`            | target 0.0 every step (no-trading reference) |
+| `long` / `short`  | constant +1 / -1 target exposure (exposure "buy-and-hold" equivalents) |
+| `random`          | uniform from {-1,-0.5,0,+0.5,+1} with a seeded RNG; multi-seed aggregation required |
+| `momentum`        | `lookback=24`, `threshold=0.001`: return over lookback > thr → +1, < -thr → -1, else 0 |
+| `mean_reversion`  | `lookback=32`, thresholds ±1.0: z-score of close vs. rolling mean/std → short/long/flat |
+| `sma_crossover`   | `short_window=5`, `long_window=20`: short SMA > long SMA → +1 etc. |
+
+Parameters are fixed, documented defaults — **not tuned on the test set**.
+Default parameters are separated from experiment parameters (§30).
+
+## 17. Evaluation framework (`forexmind/evaluation/`)
+
+`EvaluationRunner` drives every agent through the identical protocol
+(reset → observe → act → step → record) and never touches internal env state
+except documented `info`. Results are per-`Trajectory` (equity curve, returns,
+positions, trade log, metrics) with the environment/window/encoder cached per
+instrument.
+
+**Metrics** (return/risk/risk-adjusted/trading) — see `metrics.py`:
+
+- Return: `total_return`, `cumulative_log_return`, `annualized_return`.
+- Risk: per-period and annualized volatility, maximum & average drawdown,
+  downside deviation.
+- Risk-adjusted: Sharpe, Sortino, Calmar.
+- Trading: position changes, trades, avg trade duration, turnover, gross/net
+  PnL, transaction costs, winning/losing trades, win rate, avg win/loss,
+  profit factor.
+- **Annualization**: default `auto` — uses the *actual* number of valid M5
+  observations per year in the evaluated split (≈ 73k), configurable.
+
+**Reporting** is per-instrument and per-period, then equal-weighted aggregate
+(so EURUSD's row count does not dominate). Reports are JSON with full
+reproducibility metadata (dataset version, split config, env / execution /
+reward / episode / agent config, seeds, project version) plus a human-readable
+summary. Random baselines are aggregated across seeds.
+
+## 18. Leakage policy
+
+- **No random temporal splitting** — splits are chronological per instrument.
+- **No future normalization** — analytical transforms only; fitted statistics
+  are train-only.
+- **No same-bar future information** — the observation window ends at the
+  current M5 close; execution uses the next M1 open (Phase 1 convention).
+- **No test-set tuning** — validation is used for model/parameter selection;
+  the test split is final and untouched.
+- The backtest-integrity test (`tests/test_backtest_integrity.py`) constructs
+  a dataset with a huge future jump and verifies no baseline can access it.
+
+## 19. Phase 2 usage
+
+```powershell
+python -m tools.inspect_splits                     # split boundaries + integrity
+python -m tools.inspect_observation --instrument EURUSD --split train --index 1000
+python -m tools.run_baselines --split validation --episodes 100 --seed 42
+python -m tools.run_baselines --split test --episodes 100 --seed 42 --seeds 1 2 3 4 5
+python -m tools.evaluate_run --agent momentum --split validation --episodes 50 --seed 7
+```
+
+## 20. Phase 2 project layout (additions)
+
+```
+forexmind/
+    data/splits.py             # SplitConfig, SplitDataset, integrity checks
+    observation/               # schema, window, normalization, encoder
+    episodes/                  # config, sampler, trajectory, action adapters
+    baselines/                 # base + flat/random/buy_hold/momentum/mean_reversion/sma_crossover
+    evaluation/                # runner, metrics, aggregation, report
+tools/
+    inspect_splits.py, inspect_observation.py, run_baselines.py, evaluate_run.py
+tests/                         # +65 Phase 2 tests (177 total)
+```
+
+## 21. Phase 2 known limitations
+
+- Baselines use only the causal observation window; SMA/mean-reversion lookbacks
+  must be ≤ `context_length` (defaults are).
+- Equal-weighted aggregation aligns episodes by step index (all benchmarks use
+  a common horizon).
+- Per-period drawdown is within-period (resets at each period start).
+- `periods_per_year` is estimated from the split's M5 count; it is an
+  approximation of the annualization factor and is stored in every report.
+- Instrument identity is one-hot (a learned embedding is the documented
+  replacement path).
+
