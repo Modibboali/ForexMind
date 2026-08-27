@@ -11,7 +11,4 @@ Phase 1 provides:
   * target-exposure action model
   * a Gymnasium-style deterministic environment
 """
-
-from forexmind import config  # noqa: F401  (import for side-effect-free config namespace)
-
 __version__ = "0.1.0"
