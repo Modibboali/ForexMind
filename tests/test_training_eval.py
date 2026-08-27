@@ -3,6 +3,8 @@ benchmark tables (trained policy vs baselines on the untouched test split)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 from forexmind.training.benchmark import (
@@ -181,3 +183,59 @@ def test_load_checkpoint_policy_roundtrip(tmp_path) -> None:
     assert algorithm == "sac"
     for p1, p2 in zip(trainer.actor.parameters(), policy.parameters(), strict=True):
         assert np.allclose(p1.detach().numpy(), p2.detach().numpy())
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint discovery (forgiving --checkpoint resolution)
+# ---------------------------------------------------------------------------
+
+
+def _make_run_checkpoints(root: Path) -> None:
+    """Create a fake run dir with a best.pt so resolver tests can find it."""
+    (root / "sac_cpu_seed42" / "checkpoints").mkdir(parents=True)
+    (root / "sac_cpu_seed42" / "checkpoints" / "best.pt").write_bytes(b"x")
+    (root / "sac_cpu_seed42" / "checkpoints" / "step_1000.pt").write_bytes(b"x")
+
+
+def test_resolve_checkpoint_exact_path(tmp_path) -> None:
+    from forexmind.training.checkpoint import resolve_checkpoint
+
+    _make_run_checkpoints(tmp_path)
+    p = tmp_path / "sac_cpu_seed42" / "checkpoints" / "best.pt"
+    assert resolve_checkpoint(p) == p
+
+
+def test_resolve_checkpoint_run_dir(tmp_path) -> None:
+    from forexmind.training.checkpoint import resolve_checkpoint
+
+    _make_run_checkpoints(tmp_path)
+    run_dir = tmp_path / "sac_cpu_seed42"
+    assert resolve_checkpoint(run_dir) == run_dir / "checkpoints" / "best.pt"
+
+
+def test_resolve_checkpoint_run_name(tmp_path) -> None:
+    from forexmind.training.checkpoint import resolve_checkpoint
+
+    _make_run_checkpoints(tmp_path)
+    resolved = resolve_checkpoint("sac_cpu_seed42", run_root=tmp_path)
+    assert resolved == tmp_path / "sac_cpu_seed42" / "checkpoints" / "best.pt"
+
+
+def test_resolve_checkpoint_missing_lists_candidates(tmp_path) -> None:
+    from forexmind.training.checkpoint import resolve_checkpoint
+
+    _make_run_checkpoints(tmp_path)
+    with pytest.raises(FileNotFoundError) as exc:
+        resolve_checkpoint("nonexistent_run", run_root=tmp_path)
+    msg = str(exc.value)
+    assert "not found" in msg
+    assert "sac_cpu_seed42" in msg  # lists what is actually available
+    assert "best.pt" in msg
+
+
+def test_resolve_checkpoint_no_runs_clear_hint(tmp_path) -> None:
+    from forexmind.training.checkpoint import resolve_checkpoint
+
+    with pytest.raises(FileNotFoundError) as exc:
+        resolve_checkpoint("sac_cpu_seed42", run_root=tmp_path)
+    assert "Train first" in str(exc.value)

@@ -12,6 +12,7 @@ import json
 import os
 import time
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -210,27 +211,76 @@ class BaseTrainer(ABC):
     # -- training loop --------------------------------------------------------
 
     def train(self, *, resume: str | Path | None = None) -> dict[str, Any]:
-        if resume is not None:
-            self._restore_from_checkpoint(resume)
-        # Attach the policy to the collector (workers start acting with it).
-        self._sync_policy_to_workers()
-        self._log_startup()
+        try:
+            self._setup_signal_handler()
+            if resume is not None:
+                self._restore_from_checkpoint(resume)
+            # Attach the policy to the collector (workers start acting with it).
+            self._sync_policy_to_workers()
+            self._log_startup()
 
-        total = self.config.training.total_env_steps
-        while self._env_steps < total:
-            random_action = self._env_steps < self.config.training.warmup_steps
-            transitions = self.collector.collect(
-                self.config.training.collect_batch, random_action=random_action
-            )
-            self._ingest(transitions)
-            self._consume_transitions(transitions)
-            self._maybe_resync_policy()
-            self._maybe_log()
-            self._maybe_evaluate()
-            self._maybe_checkpoint()
+            # Guarantee a checkpoint exists from the very first step so a run
+            # that is interrupted before the first periodic checkpoint interval
+            # still leaves something resumable.
+            if resume is None and self.checkpoints.latest_path() is None:
+                self._save_checkpoint("step_0")
 
-        summary = self.finalize()
-        return summary
+            total = self.config.training.total_env_steps
+            while self._env_steps < total:
+                random_action = self._env_steps < self.config.training.warmup_steps
+                transitions = self.collector.collect(
+                    self.config.training.collect_batch, random_action=random_action
+                )
+                self._ingest(transitions)
+                self._consume_transitions(transitions)
+                self._maybe_resync_policy()
+                self._maybe_log()
+                self._maybe_evaluate()
+                self._maybe_checkpoint()
+
+            return self.finalize()
+        except BaseException:
+            # Rescue: persist whatever state exists so a killed/interrupted run
+            # can be resumed.  Re-raise afterwards so the caller sees the error.
+            with suppress(Exception):
+                self._rescue_checkpoint()
+            raise
+
+    def _setup_signal_handler(self) -> None:
+        """Convert SIGTERM/SIGINT into a catchable KeyboardInterrupt so the
+        rescue checkpoint runs before the process is torn down (e.g. Kaggle
+        session timeout)."""
+        import signal
+
+        def _handle(signum: int, _frame: object) -> None:
+            raise KeyboardInterrupt(f"received signal {signum}")
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with suppress(ValueError, OSError):  # non-main thread / unsupported
+                signal.signal(sig, _handle)
+
+    def _rescue_checkpoint(self) -> None:
+        if self._env_steps > 0 or not (self.run_dir / "checkpoints").exists():
+            self._save_checkpoint(f"rescue_step_{self._env_steps}")
+        self.metric_store.to_csv(self.run_dir / "learning_curve.csv")
+        self.metric_store.to_jsonl(self.run_dir / "training_log.jsonl")
+        partial = {
+            "status": "interrupted",
+            "algorithm": self.config.algorithm.name,
+            "env_steps": self._env_steps,
+            "gradient_updates": self._gradient_updates,
+            "episodes": self._episodes,
+            "best_checkpoint": self.best_checkpoint,
+            "best_validation_score": self.best_score,
+            "warnings": self._collect_warnings(),
+        }
+        (self.run_dir / "training_summary.json").write_text(
+            json.dumps(partial, indent=2, default=str), encoding="utf-8"
+        )
+        print(
+            f"\n[rescue] saved partial state at env_steps={self._env_steps} "
+            f"in {self.run_dir}"
+        )
 
     def _ingest(self, transitions: list[Transition]) -> None:
         """Bookkeeping for collected transitions (env steps, episode returns)."""
@@ -428,6 +478,9 @@ class BaseTrainer(ABC):
             # Never evaluated: save current as best so a checkpoint always exists.
             self.best_checkpoint = "best"
             self._save_checkpoint("best")
+        # Always leave a final checkpoint so the completed run is resumable /
+        # inspectable even if the periodic intervals never aligned with the end.
+        self._save_checkpoint("final")
         wall = time.perf_counter() - self._start_wall
         self.metric_store.to_csv(self.run_dir / "learning_curve.csv")
         self.metric_store.to_jsonl(self.run_dir / "training_log.jsonl")

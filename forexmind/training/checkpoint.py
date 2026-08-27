@@ -51,6 +51,96 @@ class CheckpointManager:
         return p if p.is_file() else None
 
 
+def discover_checkpoints(run_root: str | Path) -> list[Path]:
+    """Find every ``*.pt`` checkpoint under ``run_root`` (recursively)."""
+    root = Path(run_root)
+    if not root.is_dir():
+        return []
+    pts: list[Path] = []
+    for p in sorted(root.rglob("*.pt")):
+        if p.is_file():
+            pts.append(p)
+    pts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return pts
+
+
+def resolve_checkpoint(
+    checkpoint_arg: str | Path,
+    run_root: str | Path | None = None,
+) -> Path:
+    """Resolve a ``--checkpoint`` argument to an existing ``.pt`` file.
+
+    Accepts (in order of preference):
+    * an exact path to a ``.pt`` file,
+    * a directory → its ``best.pt``, ``latest.pt``, or newest ``*.pt``,
+    * a run name (e.g. ``sac_cpu_seed42``) searched under ``run_root``,
+    * a bare name like ``best.pt`` / ``latest.pt`` searched under ``run_root``.
+
+    Raises ``FileNotFoundError`` with a list of the checkpoints actually found
+    under ``run_root`` so a mistyped path is easy to fix.
+    """
+    given = Path(checkpoint_arg)
+
+    if given.is_file():
+        return given
+    if given.is_dir():
+        # Prefer the CheckpointManager layout: <dir>/checkpoints/{best,latest}.pt
+        for cand in (
+            given / "checkpoints" / "best.pt",
+            given / "checkpoints" / "latest.pt",
+            given / "best.pt",
+            given / "latest.pt",
+        ):
+            if cand.is_file():
+                return cand
+        newest = discover_checkpoints(given)
+        if newest:
+            return newest[0]
+        raise FileNotFoundError(f"no .pt checkpoint found inside directory {given}")
+
+    root = Path(run_root) if run_root is not None else None
+    all_found = discover_checkpoints(root) if root is not None else []
+
+    # Bare checkpoint name (e.g. "best.pt" / "latest.pt") anywhere under root.
+    if given.name in ("best.pt", "latest.pt") or given.suffix == ".pt":
+        for c in all_found:
+            if c.name == given.name:
+                return c
+        raise FileNotFoundError(_not_found_msg(given, root, all_found))
+
+    # Run name → <root>/<given>/checkpoints/{best,latest}.pt
+    if root is not None:
+        run_dir = root / given
+        if run_dir.is_dir():
+            for name in ("best.pt", "latest.pt"):
+                cand = run_dir / "checkpoints" / name
+                if cand.is_file():
+                    return cand
+            in_run = discover_checkpoints(run_dir)
+            if in_run:
+                raise FileNotFoundError(
+                    f"no best/latest checkpoint inside {run_dir}, "
+                    f"but found: {', '.join(str(p) for p in in_run[:10])}"
+                )
+
+    raise FileNotFoundError(_not_found_msg(given, root, all_found))
+
+
+def _not_found_msg(given: Path, root: Path | None, all_found: list[Path]) -> str:
+    if all_found:
+        listing = "\n  ".join(str(p) for p in all_found[:20])
+        return (
+            f"checkpoint {str(given)!r} not found under {root or 'cwd'}. "
+            f"Existing checkpoints:\n  {listing}"
+        )
+    return (
+        f"checkpoint {str(given)!r} not found and no .pt files under "
+        f"{root or 'cwd'}. Train first "
+        "(python -m forexmind.training.train_sac --config configs/sac_cpu.yaml), "
+        "then point --checkpoint at the produced best.pt."
+    )
+
+
 def build_checkpoint_state(
     *,
     algorithm: str,

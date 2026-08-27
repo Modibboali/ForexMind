@@ -24,6 +24,7 @@ from forexmind.training.benchmark import (
     load_checkpoint_policy,
     write_benchmark_results,
 )
+from forexmind.training.checkpoint import resolve_checkpoint
 from forexmind.training.config import ExperimentConfig
 from forexmind.training.data import (
     DEFAULT_INSTRUMENT_ORDER,
@@ -34,10 +35,31 @@ from forexmind.training.evaluator import PolicyEvaluator
 from forexmind.training.trainer import build_env_config
 
 
+def _resolve_checkpoint(args: argparse.Namespace) -> Path:
+    """Locate the checkpoint to evaluate, defaulting the search root to the
+    run root embedded in the config / CLI (``--run-root``)."""
+    run_root = args.run_root
+    if run_root is None and not args.config:
+        # Try to infer from a known config file so the search is meaningful.
+        for cand in ("configs/sac_cpu.yaml", "configs/ppo_cpu.yaml"):
+            if Path(cand).is_file():
+                try:
+                    run_root = ExperimentConfig.from_yaml(cand).logging.run_dir
+                    break
+                except Exception:
+                    pass
+    return resolve_checkpoint(args.checkpoint, run_root=run_root)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a frozen training checkpoint.")
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to a .pt checkpoint (best.pt / step_*.pt / latest.pt).")
+    parser.add_argument("--checkpoint", type=str, default="best",
+                        help="Checkpoint path, a run dir, or a run name "
+                             "(e.g. 'runs/sac_cpu_seed42/checkpoints/best.pt', "
+                             "'runs/sac_cpu_seed42', or 'sac_cpu_seed42').")
+    parser.add_argument("--run-root", type=str, default=None,
+                        help="Root directory to search for run checkpoints "
+                             "(default: from the embedded config, else 'runs').")
     parser.add_argument("--split", type=str, default="validation",
                         choices=["validation", "test"],
                         help="Which split to evaluate on.")
@@ -51,7 +73,8 @@ def main() -> None:
                         help="Output directory for benchmark tables.")
     args = parser.parse_args()
 
-    state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    checkpoint = _resolve_checkpoint(args)
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     algorithm = state.get("algorithm", "sac")
     if args.config:
         config = ExperimentConfig.from_yaml(args.config)
@@ -78,8 +101,9 @@ def main() -> None:
     )
     window_config = WindowConfig(context_length=config.environment.context_length)
     policy, algorithm = load_checkpoint_policy(
-        args.checkpoint, encoder.config.spec.encoded_shape[0], config.model
+        checkpoint, encoder.config.spec.encoded_shape[0], config.model
     )
+    print(f"Loaded checkpoint: {checkpoint}")
 
     evaluator = PolicyEvaluator(
         dataset, env_config, encoder, window_config,
@@ -111,7 +135,7 @@ def main() -> None:
         out = (
             Path(args.out)
             if args.out
-            else Path(args.checkpoint).resolve().parent.parent / "benchmark_test"
+            else checkpoint.resolve().parent.parent / "benchmark_test"
         )
         paths = write_benchmark_results(bench, out)
         print(f"\nBenchmark tables written to {out}:")

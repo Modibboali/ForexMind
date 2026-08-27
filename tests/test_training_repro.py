@@ -83,3 +83,34 @@ def test_training_summary_and_curve_files_written(tmp_path) -> None:
     assert (run_dir / "checkpoints" / "best.pt").is_file()
     assert summary["status"] == "completed"
     assert "warnings" in summary
+
+
+def test_training_saves_initial_and_final_checkpoints(tmp_path) -> None:
+    """A run must leave a resumable checkpoint even if the periodic interval
+    was never reached: step_0 is written at start, final at completion."""
+    from forexmind.training.sac import SACTrainer
+
+    trainer = SACTrainer(_small_cfg(seed=7), tmp_path / "d", dataset=_volatile_dataset())
+    assert trainer.checkpoints.latest_path() is None
+    trainer._save_checkpoint("step_0")  # what train() does at startup
+    assert (tmp_path / "d" / "checkpoints" / "step_0.pt").is_file()
+    trainer._save_checkpoint("final")  # what finalize() does at completion
+    assert (tmp_path / "d" / "checkpoints" / "final.pt").is_file()
+    assert trainer.checkpoints.latest_path() is not None
+
+
+def test_interrupted_run_leaves_rescue_checkpoint(tmp_path) -> None:
+    from forexmind.training.sac import SACTrainer
+
+    trainer = SACTrainer(_small_cfg(seed=9), tmp_path / "e", dataset=_volatile_dataset())
+    trainer._env_steps = 128
+    trainer._rescue_checkpoint()  # what train()'s except path does
+    assert (tmp_path / "e" / "checkpoints" / "rescue_step_128.pt").is_file()
+    assert (tmp_path / "e" / "training_summary.json").is_file()
+    import json as _json
+
+    summary = _json.loads(
+        (tmp_path / "e" / "training_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["status"] == "interrupted"
+    assert summary["env_steps"] == 128

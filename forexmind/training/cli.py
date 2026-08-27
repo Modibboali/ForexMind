@@ -86,6 +86,10 @@ def train_one(
     (run_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2, default=str), encoding="utf-8"
     )
+    summary["run_dir"] = str(run_dir)
+    summary["checkpoints"] = sorted(str(p) for p in (run_dir / "checkpoints").glob("*.pt"))
+    print(f"\nRun directory : {run_dir}")
+    print(f"Checkpoints   : {summary['checkpoints']}")
     return summary
 
 

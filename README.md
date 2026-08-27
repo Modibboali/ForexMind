@@ -610,14 +610,31 @@ python -m forexmind.training.train_ppo  --config configs/ppo_cpu.yaml  --seeds 1
 python -m forexmind.training.train_sac --config configs/sac_cpu.yaml --resume runs/sac_cpu_seed42/checkpoints/latest.pt
 
 # Evaluate a frozen checkpoint (validation or test)
+# --checkpoint accepts a .pt path, a run directory, or a run name (searched under --run-root)
 python -m forexmind.training.evaluate_checkpoint --checkpoint runs/sac_cpu_seed42/checkpoints/best.pt --split validation
+python -m forexmind.training.evaluate_checkpoint --checkpoint runs/sac_cpu_seed42 --split validation
+python -m forexmind.training.evaluate_checkpoint --checkpoint sac_cpu_seed42 --run-root runs --split validation
 
 # Final benchmark tables (SAC vs 7 baselines on untouched test)
-python -m forexmind.training.evaluate_checkpoint --checkpoint runs/sac_cpu_seed42/checkpoints/best.pt --benchmark --out data/reports/benchmark_sac
+python -m forexmind.training.evaluate_checkpoint --checkpoint runs/sac_cpu_seed42 --benchmark --out data/reports/benchmark_sac
 
 # Worker-throughput sweep for machine sizing
 python -m tools.benchmark_training --workers 1 2 4 8 16
 ```
+
+### Checkpoints
+
+Every run directory (e.g. `runs/sac_cpu_seed42/`) contains `checkpoints/` with:
+
+| File | When written |
+| ---- | ------------ |
+| `step_0.pt` | at training start (so a run that is interrupted before the first periodic interval still leaves a resumable checkpoint) |
+| `step_<env_steps>.pt` | every `checkpoint_every_env_steps` |
+| `best.pt` | each time validation improves (`Score = Sharpe − λ·MaxDD`), i.e. the checkpoint selected by validation |
+| `final.pt` | when a run completes |
+| `rescue_step_<env_steps>.pt` | on interruption (SIGINT/SIGTERM/exception) so the run can be resumed |
+
+`latest.txt` points at the most recent checkpoint, which is what `--resume` uses. The training launcher prints `Run directory` and the list of checkpoints at the end of each run, and `evaluate_checkpoint` prints a helpful list of existing checkpoints if you mistype a path.
 
 `ExperimentConfig` is YAML-serializable and is persisted into every run
 directory, checkpoint, and manifest, so runs are reproducible.
@@ -650,6 +667,11 @@ tests/                     # Phase 3 tests (SAC, workers, data, eval, repro)
 
 - The replay buffer is **not** persisted in checkpoints (kept small); a resumed
   run starts with an empty buffer and refills it. Only buffer metadata is saved.
+- Checkpoints are written at `checkpoint_every_env_steps` plus `step_0` at
+  start, `best` on validation improvement, `final` on completion, and a
+  `rescue_step_*` on interruption. If a run is killed by the OS (e.g. Kaggle
+  session timeout) and cannot run the signal handler, only `step_0.pt` is
+  guaranteed to exist.
 - Full bitwise reproducibility is guaranteed in the deterministic `sync`
   backend (and for worker/episode sampling in the `process` backend); the
   `process` backend's exact transition ordering can vary with OS scheduling.
@@ -657,6 +679,9 @@ tests/                     # Phase 3 tests (SAC, workers, data, eval, repro)
   structured temporal encoder is the documented replacement path.
 - Training is compute-heavy: 20M env steps × 32 workers is designed for a
   dedicated machine. Start with the smoke config and the throughput sweep
-  (`tools/benchmark_training.py`) to size the box.
+  (`tools/benchmark_training.py`) to size the box. On a shared/notebook
+  session (e.g. Kaggle) keep `num_workers` small (2–4) and `total_env_steps`
+  modest for a first run; each worker re-imports torch and loads the parquet
+  dataset, so hundreds of workers will OOM the session.
 
 
