@@ -41,7 +41,7 @@ environment:
   instruments: []
 
 compute:
-  num_workers: 32
+  num_workers: 204
   learner_device: cpu
   torch_threads: 2
   collect_backend: process

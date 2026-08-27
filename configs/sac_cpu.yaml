@@ -37,7 +37,7 @@ environment:
 compute:
   # Worker processes are independent of the learner; they load data
   # themselves.  Keep (workers + torch_threads) well under the core count.
-  num_workers: 32
+  num_workers: 204
   learner_device: cpu
   torch_threads: 2
   collect_backend: process
