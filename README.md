@@ -636,6 +636,10 @@ Every run directory (e.g. `runs/sac_cpu_seed42/`) contains `checkpoints/` with:
 
 `latest.txt` points at the most recent checkpoint, which is what `--resume` uses. The training launcher prints `Run directory` and the list of checkpoints at the end of each run, and `evaluate_checkpoint` prints a helpful list of existing checkpoints if you mistype a path.
 
+### Progress bar
+
+Training shows a live `tqdm` bar with the current / total environment steps, elapsed time, **ETA** and rate (env steps/s), plus live diagnostics in the suffix (gradient updates, recent mean episode return, and SAC `alpha`/`entropy`/`q1` or PPO `entropy`/`actor_loss`). `tqdm` is an optional dependency (install with `pip install tqdm` or `pip install -e .[train]`); if it is missing, training still runs and prints the periodic progress blocks instead.
+
 `ExperimentConfig` is YAML-serializable and is persisted into every run
 directory, checkpoint, and manifest, so runs are reproducible.
 

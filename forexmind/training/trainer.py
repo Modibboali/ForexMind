@@ -81,6 +81,7 @@ class BaseTrainer(ABC):
         torch.set_num_threads(max(1, config.compute.torch_threads))
         os.environ.setdefault("OMP_NUM_THREADS", str(max(1, config.compute.torch_threads)))
         os.environ.setdefault("MKL_NUM_THREADS", str(max(1, config.compute.torch_threads)))
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(max(1, config.compute.torch_threads)))
 
         if dataset is not None:
             self.dataset = dataset
@@ -110,6 +111,8 @@ class BaseTrainer(ABC):
         self.action_dim = 1
 
         self.collector = self._build_collector()
+        self._producer_worker_ids: set[int] = set()
+        self._cpu_sampler = self._make_cpu_sampler()
         self.metric_store = MetricStore()
         self.logger = TrainerLogger(verbose=True)
         self.checkpoints = CheckpointManager(self.run_dir)
@@ -159,6 +162,40 @@ class BaseTrainer(ABC):
         return torch.device(name)
 
     # -- collector ------------------------------------------------------------
+
+    def _make_cpu_sampler(self) -> Any:
+        """Process-tree CPU sampler for trainer + live workers (Kaggle)."""
+        from forexmind.training.runtime_diagnostics import ProcessTreeCpuSampler
+
+        return ProcessTreeCpuSampler(worker_pids=getattr(self.collector, "worker_pids", []))
+
+    def _start_cpu_sampling(self) -> None:
+        sampler = self._cpu_sampler
+        if sampler is not None:
+            sampler.start()
+
+    def _report_cpu_interval(self) -> None:
+        """Print average process-tree CPU since the previous log interval.
+
+        Uses psutil window semantics: ``start()`` primes the counters and
+        ``stop()`` returns the average percent since the prime, so each call
+        reports the average over the whole logging interval without blocking.
+        """
+        sampler = self._cpu_sampler
+        if sampler is None or not sampler.has_procs:
+            return
+        cpu = sampler.stop()
+        print(
+            "[cpu] interval_avg "
+            f"trainer={float(cpu.get('trainer_cpu_percent', 0.0)):.1f}% "
+            f"worker_agg={float(cpu.get('worker_cpu_percent', 0.0)):.1f}% "
+            f"tree={float(cpu.get('process_tree_cpu_percent', 0.0)):.1f}% "
+            f"live_workers={getattr(self.collector, 'alive_workers', 0)} "
+            f"producers={len(self._producer_worker_ids)} "
+            f"env_steps={self._env_steps:,}",
+            flush=True,
+        )
+        sampler.start()
 
     def _build_collector(self) -> SyncCollector | ProcessCollector:
         cfg = self.config
@@ -219,6 +256,7 @@ class BaseTrainer(ABC):
             # Attach the policy to the collector (workers start acting with it).
             self._sync_policy_to_workers()
             self._log_startup()
+            self._start_cpu_sampling()
 
             # Guarantee a checkpoint exists from the very first step so a run
             # that is interrupted before the first periodic checkpoint interval
@@ -290,13 +328,11 @@ class BaseTrainer(ABC):
         (self.run_dir / "training_summary.json").write_text(
             json.dumps(partial, indent=2, default=str), encoding="utf-8"
         )
-        print(
-            f"\n[rescue] saved partial state at env_steps={self._env_steps} "
-            f"in {self.run_dir}"
-        )
+        print(f"\n[rescue] saved partial state at env_steps={self._env_steps} in {self.run_dir}")
 
     def _ingest(self, transitions: list[Transition]) -> None:
         """Bookkeeping for collected transitions (env steps, episode returns)."""
+        self._producer_worker_ids.update(t.worker_id for t in transitions)
         for t in transitions:
             self._env_steps += 1
             self._episode_reward += t.reward
@@ -361,6 +397,7 @@ class BaseTrainer(ABC):
             self.logger.progress_block(
                 f"{self.config.algorithm.name.upper()} TRAINING PROGRESS", fields
             )
+            self._report_cpu_interval()
 
     def _recent_returns(self, n: int = 200) -> list[float]:
         return self._episode_returns[-n:] or [0.0]
@@ -388,7 +425,9 @@ class BaseTrainer(ABC):
             context_length=self.config.environment.context_length,
         )
         eval_result = evaluator.evaluate(
-            self.policy(), self.config.algorithm.name, "validation",
+            self.policy(),
+            self.config.algorithm.name,
+            "validation",
             self.config.evaluation.validation_episodes,
         )
         score = eval_result.score
@@ -400,9 +439,7 @@ class BaseTrainer(ABC):
         }
         self.validation_history.append(entry)
         val_fields = {
-            f"val_{k}": v
-            for k, v in entry.items()
-            if k not in ("env_steps", "gradient_updates")
+            f"val_{k}": v for k, v in entry.items() if k not in ("env_steps", "gradient_updates")
         }
         self.metric_store.record(
             env_steps=self._env_steps,
@@ -469,8 +506,19 @@ class BaseTrainer(ABC):
 
     def _log_startup(self) -> None:
         from forexmind.training.data import dataset_summary
+        from forexmind.training.runtime_diagnostics import (
+            cpu_affinity,
+            logical_cpu_count,
+            thread_env_report,
+            torch_thread_report,
+        )
 
         ds = dataset_summary(self.dataset)
+        worker_pids = getattr(self.collector, "worker_pids", [])
+        alive_workers = getattr(self.collector, "alive_workers", 0)
+        torch_report = torch_thread_report()
+        thread_env = thread_env_report()
+        affinity = cpu_affinity()
         self.logger.progress_block(
             f"{self.config.algorithm.name.upper()} TRAINING START",
             {
@@ -484,12 +532,39 @@ class BaseTrainer(ABC):
                 "M5 rows": f"{ds['total_m5_rows']:,}",
                 "Estimated memory MB": ds["estimated_memory_mb"],
                 "Seed": self.config.compute.seed,
+                "Logical CPUs": logical_cpu_count(),
+                "CPU affinity count": len(affinity) if affinity is not None else "unknown",
+                "Torch threads": torch_report,
+                "OMP_NUM_THREADS": thread_env["OMP_NUM_THREADS"],
+                "MKL_NUM_THREADS": thread_env["MKL_NUM_THREADS"],
+                "OPENBLAS_NUM_THREADS": thread_env["OPENBLAS_NUM_THREADS"],
+                "Worker PIDs": worker_pids,
+                "Alive workers": alive_workers,
             },
         )
 
     # -- finalization ---------------------------------------------------------
 
     def finalize(self) -> dict[str, Any]:
+        from forexmind.training.runtime_diagnostics import print_process_tree_report
+
+        # Capture the final process-tree CPU sample BEFORE closing workers
+        # (once workers are joined their CPU percent is gone).
+        cpu_report: dict[str, object] = {}
+        sampler = self._cpu_sampler
+        if sampler is not None and sampler.has_procs:
+            cpu_report = dict(sampler.stop())
+            print_process_tree_report(
+                worker_pids=getattr(self.collector, "worker_pids", []),
+                workers_configured=self.config.compute.num_workers
+                if self.config.compute.collect_backend == "process"
+                else 0,
+                sample_seconds=0.0,
+                cpu_sample=cpu_report,
+                producer_ids=self._producer_worker_ids,
+                label="FINAL PROCESS TREE",
+            )
+        workers_alive = getattr(self.collector, "alive_workers", 0)
         self.collector.close()
         if self.best_checkpoint is None:
             # Never evaluated: save current as best so a checkpoint always exists.
@@ -511,6 +586,13 @@ class BaseTrainer(ABC):
             "best_validation_score": self.best_score,
             "wall_seconds": round(wall, 2),
             "steps_per_second": round(self._env_steps / wall, 1) if wall > 0 else 0.0,
+            "workers_configured": self.config.compute.num_workers,
+            "workers_alive_at_finalize": workers_alive,
+            "workers_producing_transitions": len(self._producer_worker_ids),
+            "trainer_cpu_percent": cpu_report.get("trainer_cpu_percent", 0.0),
+            "worker_cpu_percent": cpu_report.get("worker_cpu_percent", 0.0),
+            "process_tree_cpu_percent": cpu_report.get("process_tree_cpu_percent", 0.0),
+            "effective_cores_utilized": cpu_report.get("effective_cores_utilized", 0.0),
             "warnings": self._collect_warnings(),
         }
         (self.run_dir / "training_summary.json").write_text(

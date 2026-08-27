@@ -17,6 +17,7 @@ inherited copy-on-write.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -46,6 +47,8 @@ class Transition:
     log_prob: float = 0.0
     value: float = 0.0
     next_value: float = 0.0
+    worker_id: int = -1
+    worker_pid: int = 0
 
 
 def worker_episode_seed(global_seed: int, worker_id: int, episode_index: int) -> int:
@@ -199,6 +202,8 @@ class EnvWorker:
             log_prob=log_prob,
             value=value,
             next_value=next_value,
+            worker_id=self.worker_id,
+            worker_pid=os.getpid(),
         )
         self._active = (env, builder, _spec, next_obs)
         self._total_steps += 1
@@ -237,6 +242,12 @@ def _worker_process_main(
     cfg: dict[str, Any], q_in: Any, q_out: Any
 ) -> None:  # pragma: no cover
     """Subprocess entry: rebuild worker from a picklable config dict."""
+    worker_id = int(cfg["worker_id"])
+    print(
+        f"[collector-worker] start worker_id={worker_id} pid={os.getpid()} "
+        f"parent_pid={os.getppid()}",
+        flush=True,
+    )
     split_config = SplitConfig.from_dict(cfg["split_config"])
     dataset = make_training_dataset(
         cfg["processed_dir"], split_config, tuple(cfg["instruments"])
@@ -266,7 +277,7 @@ def _worker_process_main(
         model_config=model,
         obs_dim=cfg["obs_dim"],
         action_dim=cfg["action_dim"],
-        worker_id=cfg["worker_id"],
+        worker_id=worker_id,
         global_seed=cfg["global_seed"],
         policy=policy,
     )
@@ -292,6 +303,7 @@ def _worker_process_main(
             q_out.put(out)
         else:  # pragma: no cover
             raise ValueError(f"unknown worker message {kind!r}")
+    print(f"[collector-worker] stop worker_id={worker_id} pid={os.getpid()}", flush=True)
     q_out.put(None)
 
 
@@ -344,6 +356,32 @@ class ProcessCollector:
             self._q_in.append(q_in)
             self._q_out.append(q_out)
             self._procs.append(p)
+        print(
+            "[collector] process backend started "
+            f"configured_workers={self.num_workers} "
+            f"alive_workers={self.alive_workers} "
+            f"worker_pids={self.worker_pids}",
+            flush=True,
+        )
+
+    @property
+    def worker_pids(self) -> list[int]:
+        return [int(p.pid) for p in self._procs if p.pid is not None]
+
+    @property
+    def alive_workers(self) -> int:
+        return sum(1 for p in self._procs if p.is_alive())
+
+    def worker_status(self) -> list[dict[str, int | bool | None]]:
+        return [
+            {
+                "worker_index": i,
+                "pid": int(p.pid) if p.pid is not None else None,
+                "alive": bool(p.is_alive()),
+                "exitcode": p.exitcode,
+            }
+            for i, p in enumerate(self._procs)
+        ]
 
     def set_policy(self, policy: nn.Module, value_net: nn.Module | None = None) -> None:
         state = {k: v.detach().cpu().numpy() for k, v in policy.state_dict().items()}
@@ -370,6 +408,13 @@ class ProcessCollector:
             q.put(None)
         for p in self._procs:
             p.join(timeout=30)
+        print(
+            "[collector] process backend stopped "
+            f"configured_workers={self.num_workers} "
+            f"alive_workers={self.alive_workers} "
+            f"worker_pids={self.worker_pids}",
+            flush=True,
+        )
         for q in self._q_in:
             q.close()
         for q in self._q_out:

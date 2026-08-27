@@ -20,6 +20,7 @@ train = [
     "torch>=2.1",
     "pyyaml>=6.0",
     "tqdm>=4.66",
+    "psutil>=5.9",
 ]
 
 [tool.pytest.ini_options]

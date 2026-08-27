@@ -192,11 +192,15 @@ def test_process_collector_start_stop_collect(tmp_path) -> None:
         global_seed=123,
         num_workers=2,
     )
+    assert len(collector.worker_pids) == 2
+    assert collector.alive_workers == 2
     collector.set_policy(policy)
     try:
         batch = collector.collect(32, random_action=False)
     finally:
         collector.close()
     assert len(batch) == 32
+    assert {t.worker_id for t in batch} == {0, 1}
+    assert {t.worker_pid for t in batch} == set(collector.worker_pids)
     for t in batch:
         assert -1.0 <= t.action <= 1.0
