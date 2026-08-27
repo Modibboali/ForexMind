@@ -1,4 +1,4 @@
-# ForexMind — Phases 1 & 2
+# ForexMind — Phases 1, 2 & 3
 
 A research-grade, **deterministic** Forex market/data environment and learning
 protocol for reinforcement-learning research.
@@ -11,10 +11,16 @@ protocol for reinforcement-learning research.
 - **Phase 2** adds the leakage-free learning/evaluation layer: temporal
   train/validation/test splits, a causal observation encoder, a deterministic
   episode sampler, baseline strategies, and a full evaluation framework.
+- **Phase 3** adds model-free RL training infrastructure: SAC (twin critics +
+  auto entropy temperature) and PPO on the MLP(351) observation baseline,
+  multi-CPU experience collection, checkpoints with resume, validation-based
+  checkpoint selection, and automatic final test-split comparison tables
+  against the seven baselines.
 
 > Phases 1-2 deliberately contain **no** neural networks, no RL algorithms, no
 > MCTS, no technical-indicator feature libraries, no live trading. They build
 > the deterministic simulator and evaluation protocol that later phases reuse.
+> Phase 3 adds model-free RL only — no MuZero/MCTS/Dreamer/world models.
 
 ---
 
@@ -554,4 +560,103 @@ tests/                         # +65 Phase 2 tests (177 total)
   approximation of the annualization factor and is stored in every report.
 - Instrument identity is one-hot (a learned embedding is the documented
   replacement path).
+
+---
+
+# Phase 3 — Model-free RL training infrastructure
+
+Phase 3 implements **model-free RL training** (SAC, then PPO) on the stable
+Phases 1–2 foundation. It intentionally does **not** include MuZero, MCTS,
+Dreamer, or a world model — those remain future phases.
+
+Goals:
+
+- Continuous **target-exposure** actions in $[-1, 1]$ (long/flat/short).
+- **SAC** with twin critics + target critics and **automatic entropy
+  temperature**; **PPO** with a clipped Gaussian policy and GAE.
+- **Multi-CPU** training: worker processes are independent of the learner and
+  configurable (`num_workers`), with CPU oversubscription prevented by setting
+  `torch.set_num_threads` + `OMP/MKL_NUM_THREADS`.
+- **Meaningful learning units**: `env_steps` and `gradient_updates` are
+  tracked **separately**.
+- **Checkpoints with resume**, automatic validation-based checkpoint selection
+  (`Score = Sharpe − λ·MaxDD` default), and a final **test protocol** that
+  freezes the best checkpoint and runs the untouched test split.
+- **Automatic final result tables** (SAC vs. 7 baselines, per-instrument,
+  per-year) in JSON/CSV/text.
+- **Multi-seed** support (`--seeds 1 2 3 4 5`) with per-seed run directories.
+
+## 22. Leakage-free protocol (unchanged from Phase 2)
+
+1. **Train split only** enters the replay buffer / rollouts.
+   (`environment.split: train`; the collector is wired to the train range.)
+2. **Validation** is used *only* to select the best checkpoint
+   (`Score = Sharpe − λ·max_drawdown_pct`, default λ = 1.0).
+3. **Test** is evaluated exactly once at the end with the frozen best
+   checkpoint — never during training.
+4. Deterministic evaluation: the policy mean, no exploration noise.
+
+## 23. Running training
+
+```powershell
+# Smoke test (tiny, deterministic, in-process)
+python -m forexmind.training.train_sac --config configs/sac_smoke.yaml
+
+# Real experiment on a dedicated multi-CPU machine
+python -m forexmind.training.train_sac --config configs/sac_cpu.yaml --seeds 1 2 3 4 5
+python -m forexmind.training.train_ppo  --config configs/ppo_cpu.yaml  --seeds 1 2 3 4 5
+
+# Resume from a checkpoint
+python -m forexmind.training.train_sac --config configs/sac_cpu.yaml --resume runs/sac_cpu_seed42/checkpoints/latest.pt
+
+# Evaluate a frozen checkpoint (validation or test)
+python -m forexmind.training.evaluate_checkpoint --checkpoint runs/sac_cpu_seed42/checkpoints/best.pt --split validation
+
+# Final benchmark tables (SAC vs 7 baselines on untouched test)
+python -m forexmind.training.evaluate_checkpoint --checkpoint runs/sac_cpu_seed42/checkpoints/best.pt --benchmark --out data/reports/benchmark_sac
+
+# Worker-throughput sweep for machine sizing
+python -m tools.benchmark_training --workers 1 2 4 8 16
+```
+
+`ExperimentConfig` is YAML-serializable and is persisted into every run
+directory, checkpoint, and manifest, so runs are reproducible.
+
+## 24. Phase 3 project layout (additions)
+
+```
+forexmind/training/
+    __init__.py            # SACTrainer, PPOTrainer, ExperimentConfig
+    config.py              # ExperimentConfig + nested dataclasses (YAML/JSON)
+    networks.py            # MLP, SquashedGaussianActor, TwinQCritic, GaussianPolicy, ValueNet
+    replay.py              # high-throughput numpy ring buffer (train split only)
+    data.py                # processed-parquet dataset access + startup report
+    policies.py            # build_policy_network, sample_action, PolicyAgent (eval)
+    collector.py           # EnvWorker, SyncCollector, ProcessCollector (multi-CPU)
+    checkpoint.py          # CheckpointManager, build_checkpoint_state
+    metrics.py             # MetricStore, TrainerLogger, warnings (pathological policies)
+    evaluator.py           # PolicyEvaluator + selection_score (uses Phase-2 runner)
+    trainer.py             # BaseTrainer (loop, schedules, resume, finalize)
+    sac.py                 # SACTrainer
+    ppo.py                 # PPOTrainer
+    benchmark.py           # final test tables (SAC vs baselines)
+    cli.py, train_sac.py, train_ppo.py, evaluate_checkpoint.py
+configs/                   # sac_cpu.yaml, ppo_cpu.yaml, sac_smoke.yaml, ppo_smoke.yaml
+tools/benchmark_training.py
+tests/                     # Phase 3 tests (SAC, workers, data, eval, repro)
+```
+
+## 25. Phase 3 known limitations
+
+- The replay buffer is **not** persisted in checkpoints (kept small); a resumed
+  run starts with an empty buffer and refills it. Only buffer metadata is saved.
+- Full bitwise reproducibility is guaranteed in the deterministic `sync`
+  backend (and for worker/episode sampling in the `process` backend); the
+  `process` backend's exact transition ordering can vary with OS scheduling.
+- The default network is the flat `MLP(351)` observation baseline — a
+  structured temporal encoder is the documented replacement path.
+- Training is compute-heavy: 20M env steps × 32 workers is designed for a
+  dedicated machine. Start with the smoke config and the throughput sweep
+  (`tools/benchmark_training.py`) to size the box.
+
 

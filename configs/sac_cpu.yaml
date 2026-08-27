@@ -1,0 +1,63 @@
+# ForexMind Phase 3 — SAC training config for a dedicated multi-CPU machine.
+# Launch with:
+#   python -m forexmind.training.train_sac --config configs/sac_cpu.yaml --seeds 1 2 3 4 5
+algorithm:
+  name: sac
+
+model:
+  hidden_dim: 256
+  num_layers: 2
+  activation: relu
+
+training:
+  total_env_steps: 20000000
+  batch_size: 256
+  replay_capacity: 1000000
+  warmup_steps: 20000
+  gradient_updates_per_step: 1
+  collect_batch: 2048
+  gamma: 0.99
+  tau: 0.005
+  learning_rate: 0.0003
+  alpha: auto
+  target_entropy: null
+  policy_sync_interval: 20000
+
+environment:
+  split: train
+  context_length: 64
+  horizon: 512
+  initial_balance: "10000"
+  leverage: 50.0
+  spread: 0.0002
+  commission: 0.0
+  sizing_mode: equity_fraction
+  instruments: []
+
+compute:
+  # Worker processes are independent of the learner; they load data
+  # themselves.  Keep (workers + torch_threads) well under the core count.
+  num_workers: 32
+  learner_device: cpu
+  torch_threads: 2
+  collect_backend: process
+  seed: 42
+
+logging:
+  log_every_env_steps: 500000
+  evaluate_every_env_steps: 2000000
+  checkpoint_every_env_steps: 2000000
+  run_dir: runs
+
+evaluation:
+  validation_episodes: 100
+  test_episodes: 100
+  eval_horizon: 512
+  eval_seed: 42
+
+selection:
+  metric: sharpe_drawdown
+  lambda_drawdown: 1.0
+
+run_id: sac_cpu
+dataset_version: processed-parquet-2026
