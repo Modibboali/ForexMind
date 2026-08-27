@@ -185,6 +185,28 @@ def test_load_checkpoint_policy_roundtrip(tmp_path) -> None:
         assert np.allclose(p1.detach().numpy(), p2.detach().numpy())
 
 
+def test_load_checkpoint_policy_roundtrip_ppo(tmp_path) -> None:
+    """A PPO checkpoint must load a GaussianPolicy (was a SAC actor -> bug)."""
+    from forexmind.training.networks import GaussianPolicy
+    from forexmind.training.ppo import PPOTrainer
+
+    cfg = ExperimentConfig.smoke("ppo")
+    cfg.environment.instruments = ("EURUSD",)
+    cfg.logging.run_dir = "runs_smoke_test"
+    trainer = PPOTrainer(cfg, tmp_path, dataset=_ds())
+    trainer._save_checkpoint("x")
+    policy, algorithm = load_checkpoint_policy(
+        tmp_path / "checkpoints" / "x.pt", trainer.obs_dim, cfg.model
+    )
+    assert algorithm == "ppo"
+    assert isinstance(policy, GaussianPolicy)
+    # And it must actually be usable through the PPO action path.
+    action = sample_action(policy, np.zeros(trainer.obs_dim, dtype=np.float32), "ppo")
+    assert -1.0 <= action <= 1.0
+    for p1, p2 in zip(trainer.actor.parameters(), policy.parameters(), strict=True):
+        assert np.allclose(p1.detach().numpy(), p2.detach().numpy())
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint discovery (forgiving --checkpoint resolution)
 # ---------------------------------------------------------------------------

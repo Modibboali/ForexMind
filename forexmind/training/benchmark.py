@@ -328,18 +328,31 @@ def write_benchmark_results(
 def load_checkpoint_policy(
     checkpoint_path: str | Path, obs_dim: int, model: Any
 ) -> tuple[nn.Module, str]:
-    """Build the policy network and load weights from a checkpoint file."""
-    from forexmind.training.networks import build_sac_networks
+    """Build the policy network and load weights from a checkpoint file.
+
+    Builds the algorithm-appropriate policy (``SquashedGaussianActor`` for
+    SAC, ``GaussianPolicy`` for PPO) from the checkpoint's ``algorithm``
+    field.  Previously this hardcoded SAC networks, so evaluating a PPO
+    checkpoint returned a SAC actor while the caller dispatched on "ppo"
+    -> AttributeError: 'SquashedGaussianActor' has no attribute 'act'.
+    """
+    from forexmind.training.config import ExperimentConfig
+    from forexmind.training.policies import build_policy_network
 
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     algorithm = state.get("algorithm", "sac")
     cfg = state.get("config", {})
-    if isinstance(cfg, dict):
-        from forexmind.training.config import ExperimentConfig
-
-        exp_cfg = ExperimentConfig.from_dict(cfg)
-        model = exp_cfg.model
-    nets = build_sac_networks(obs_dim, 1, model)
-    nets.actor.load_state_dict({k: torch.as_tensor(v) for k, v in state["policy"].items()})
-    nets.actor.eval()
-    return nets.actor, algorithm
+    exp_cfg = (
+        ExperimentConfig.from_dict(cfg) if isinstance(cfg, dict) else ExperimentConfig()
+    )
+    policy = build_policy_network(
+        algorithm,
+        obs_dim,
+        1,
+        exp_cfg.model,
+        log_std_min=exp_cfg.training.log_std_min,
+        log_std_max=exp_cfg.training.log_std_max,
+    )
+    policy.load_state_dict({k: torch.as_tensor(v) for k, v in state["policy"].items()})
+    policy.eval()
+    return policy, algorithm
