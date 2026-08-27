@@ -44,6 +44,7 @@ from forexmind.training.metrics import (
     action_distribution,
     pathological_warnings,
 )
+from forexmind.training.progress import make_progress_bar
 
 
 def _to_float(value: object, default: float = 0.0) -> float:
@@ -226,17 +227,29 @@ class BaseTrainer(ABC):
                 self._save_checkpoint("step_0")
 
             total = self.config.training.total_env_steps
-            while self._env_steps < total:
-                random_action = self._env_steps < self.config.training.warmup_steps
-                transitions = self.collector.collect(
-                    self.config.training.collect_batch, random_action=random_action
-                )
-                self._ingest(transitions)
-                self._consume_transitions(transitions)
-                self._maybe_resync_policy()
-                self._maybe_log()
-                self._maybe_evaluate()
-                self._maybe_checkpoint()
+            bar = make_progress_bar(
+                total,
+                desc=f"{self.config.algorithm.name.upper()} training",
+                unit=" env steps",
+            )
+            with bar:
+                while self._env_steps < total:
+                    random_action = self._env_steps < self.config.training.warmup_steps
+                    transitions = self.collector.collect(
+                        self.config.training.collect_batch, random_action=random_action
+                    )
+                    self._ingest(transitions)
+                    self._consume_transitions(transitions)
+                    self._maybe_resync_policy()
+                    self._maybe_log()
+                    self._maybe_evaluate()
+                    self._maybe_checkpoint()
+                    bar.update(len(transitions))
+                    bar.set_postfix(
+                        grad=f"{self._gradient_updates:,}",
+                        ret=f"{float(np.mean(self._recent_returns())):+.6f}",
+                        **self._progress_postfix(),
+                    )
 
             return self.finalize()
         except BaseException:
@@ -315,6 +328,10 @@ class BaseTrainer(ABC):
 
     def _record_diagnostics(self, diag: dict[str, float]) -> None:
         self._diag_history.append(diag)
+
+    def _progress_postfix(self) -> dict[str, object]:
+        """Algorithm-specific fields shown in the tqdm bar (default: none)."""
+        return {}
 
     # -- schedules ------------------------------------------------------------
 

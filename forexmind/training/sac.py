@@ -160,6 +160,10 @@ class SACTrainer(BaseTrainer):
         self._last_diag = diag
         return diag
 
+    def _progress_postfix(self) -> dict[str, object]:
+        d = self._last_diag
+        return {k: f"{d[k]:+.4f}" for k in ("alpha", "entropy", "q1") if k in d}
+
     # -- checkpointing --------------------------------------------------------
 
     def state_dicts(self) -> dict[str, Any]:

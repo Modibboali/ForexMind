@@ -153,7 +153,7 @@ class PPOTrainer(BaseTrainer):
                 total_entropy += float(entropy.item())
                 n_batches += 1
 
-        return {
+        diag = {
             "actor_loss": total_actor / max(1, n_batches),
             "critic_loss": total_value / max(1, n_batches),
             "entropy": total_entropy / max(1, n_batches),
@@ -162,6 +162,12 @@ class PPOTrainer(BaseTrainer):
             "q1": float(np.mean(val)),
             "q2": 0.0,
         }
+        self._last_diag = diag
+        return diag
+
+    def _progress_postfix(self) -> dict[str, object]:
+        d = getattr(self, "_last_diag", {})
+        return {k: f"{d[k]:+.4f}" for k in ("entropy", "actor_loss") if k in d}
 
     # -- checkpointing --------------------------------------------------------
 
