@@ -18,7 +18,6 @@ from forexmind.training.config import ExperimentConfig, default_config
 from forexmind.training.data import (
     DEFAULT_INSTRUMENT_ORDER,
     DEFAULT_PROCESSED_DIR,
-    make_training_dataset,
 )
 from forexmind.training.runtime_diagnostics import print_process_tree_report
 from forexmind.training.trainer import build_env_config
@@ -33,13 +32,30 @@ def _load_config(args: argparse.Namespace) -> ExperimentConfig:
     return cfg
 
 
+def _resolved_workers(cfg: ExperimentConfig) -> int:
+    """Concrete worker count, resolving ``num_workers: auto`` from RAM."""
+    if cfg.compute.num_workers != "auto":
+        return int(cfg.compute.num_workers)
+    from forexmind.training.memory_planning import estimate_auto_worker_count
+
+    est_worker_mb = 400.0 if cfg.compute.dataset_backend == "mmap" else 4500.0
+    return estimate_auto_worker_count(worker_rss_mb=est_worker_mb)
+
+
 def _build_process_collector(cfg: ExperimentConfig) -> ProcessCollector:
+    from forexmind.training.dataset_mmap import resolve_dataset
+
     instruments = (
         tuple(cfg.environment.instruments)
         if cfg.environment.instruments
         else DEFAULT_INSTRUMENT_ORDER
     )
-    dataset = make_training_dataset(DEFAULT_PROCESSED_DIR, None, instruments)
+    dataset, _backend = resolve_dataset(
+        processed_dir=DEFAULT_PROCESSED_DIR,
+        split_config=None,
+        instruments=instruments,
+        backend=cfg.compute.dataset_backend,
+    )
     env_config = build_env_config(cfg.environment)
     encoder = ObservationEncoder(
         EncoderConfig(
@@ -67,7 +83,8 @@ def _build_process_collector(cfg: ExperimentConfig) -> ProcessCollector:
         obs_dim=encoder.config.spec.encoded_shape[0],
         action_dim=1,
         global_seed=cfg.compute.seed,
-        num_workers=cfg.compute.num_workers,
+        num_workers=_resolved_workers(cfg),
+        dataset_backend=cfg.compute.dataset_backend,
     )
 
 
@@ -88,6 +105,7 @@ def main() -> None:
     cfg = _load_config(args)
     collector: ProcessCollector | None = None
     worker_pids: list[int] = []
+    workers = _resolved_workers(cfg)
     try:
         if cfg.compute.collect_backend == "process":
             collector = _build_process_collector(cfg)
@@ -102,9 +120,7 @@ def main() -> None:
                 )
         print_process_tree_report(
             worker_pids=worker_pids,
-            workers_configured=cfg.compute.num_workers
-            if cfg.compute.collect_backend == "process"
-            else 0,
+            workers_configured=workers if cfg.compute.collect_backend == "process" else 0,
             sample_seconds=args.sample_seconds,
         )
     finally:

@@ -32,7 +32,6 @@ from forexmind.episodes.config import EpisodeConfig
 from forexmind.episodes.sampler import EpisodeSampler
 from forexmind.observation.encoder import EncoderConfig, ObservationEncoder
 from forexmind.observation.window import MarketWindowBuilder, WindowConfig
-from forexmind.training.data import make_training_dataset
 from forexmind.training.policies import build_policy_network, sample_action
 
 
@@ -255,7 +254,14 @@ def _worker_process_main(cfg: dict[str, Any], q_in: Any, q_out: Any) -> None:  #
         flush=True,
     )
     split_config = SplitConfig.from_dict(cfg["split_config"])
-    dataset = make_training_dataset(cfg["processed_dir"], split_config, tuple(cfg["instruments"]))
+    from forexmind.training.dataset_mmap import resolve_dataset
+
+    dataset, _dataset_backend = resolve_dataset(
+        processed_dir=cfg["processed_dir"],
+        split_config=split_config,
+        instruments=tuple(cfg["instruments"]),
+        backend=cfg.get("dataset_backend", "auto"),
+    )
     env_config = cfg["env_config"]
     encoder_config = cfg["encoder_config"]
     window_config = cfg["window_config"]
@@ -335,6 +341,7 @@ class ProcessCollector:
         num_workers: int,
         log_std_min: float = -5.0,
         log_std_max: float = 2.0,
+        dataset_backend: str = "auto",
     ) -> None:
         self.num_workers = max(1, num_workers)
         ctx = mp.get_context("spawn")
@@ -357,6 +364,7 @@ class ProcessCollector:
             "global_seed": global_seed,
             "log_std_min": log_std_min,
             "log_std_max": log_std_max,
+            "dataset_backend": dataset_backend,
         }
         for wid in range(self.num_workers):
             q_in = ctx.Queue()

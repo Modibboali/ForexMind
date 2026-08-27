@@ -66,11 +66,21 @@ environment:
   max_reward: null
 
 compute:
-  num_workers: 102
+  # num_workers: auto estimates a safe worker count from detected RAM, the
+  # dataset backend's per-worker footprint, and a trainer reserve.  The Kaggle
+  # memory benchmark (tools/benchmark_ppo_memory) is the source of truth for
+  # the final value; auto keeps RAM headroom instead of running near 330 GB.
+  num_workers: auto
   learner_device: cpu
   torch_threads: 2
   torch_interop_threads: 2
   collect_backend: process
+  # mmap = workers share the same read-only memory-mapped pages instead of each
+  # materialising ~3 GB of parquet privately (build once with
+  #   python -m tools.build_shared_dataset
+  # then auto-detected).  Keeps process-tree RAM near one dataset copy.
+  dataset_backend: mmap
+  memory_limit_fraction: 0.70
   seed: 42
 
 logging:

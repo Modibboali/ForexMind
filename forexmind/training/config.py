@@ -81,11 +81,13 @@ class TrainingEnvConfig:
 
 @dataclass
 class ComputeConfig:
-    num_workers: int = 4  # environment worker processes (independent of learner)
+    num_workers: int | str = 4  # env worker processes; "auto" = estimate from RAM
     learner_device: str = "cpu"  # "cpu" | "cuda"
     torch_threads: int = 2  # learner BLAS threads (prevent oversubscription)
     torch_interop_threads: int | None = None  # None = leave torch default
     collect_backend: str = "sync"  # "sync" (deterministic, in-process) | "process"
+    dataset_backend: str = "auto"  # "auto" | "parquet" | "mmap" (shared store)
+    memory_limit_fraction: float | None = None  # warn when est. tree RAM > fraction
     seed: int = 42
 
 

@@ -289,3 +289,153 @@ def print_process_tree_report(
     print(f"OPENBLAS_NUM_THREADS: {env_report['OPENBLAS_NUM_THREADS']}")
     print("=" * 60)
     return report
+
+
+# ---------------------------------------------------------------------------
+# Memory (RSS / USS) diagnostics
+# ---------------------------------------------------------------------------
+
+
+def process_rss_mb(pid: int | None = None) -> float | None:
+    """RSS in MB for a process, or ``None`` when psutil is unavailable."""
+    target = os.getpid() if pid is None else int(pid)
+    psutil = _psutil_module()
+    if psutil is None:
+        return None
+    try:
+        return float(psutil.Process(target).memory_info().rss / 1e6)
+    except Exception:
+        return None
+
+
+def process_uss_mb(pid: int) -> float | None:
+    """Unique Set Size (private, non-shared) in MB, best effort.
+
+    On Linux this excludes the shared memory-mapped dataset pages, so it is
+    the right metric for the shared-store win.  Falls back to ``None`` when
+    the platform does not expose USS.
+    """
+    psutil = _psutil_module()
+    if psutil is None:
+        return None
+    try:
+        info = psutil.Process(int(pid)).memory_full_info()
+    except Exception:
+        return None
+    uss = getattr(info, "uss", None)
+    return float(uss / 1e6) if uss else None
+
+
+def memory_report(
+    *,
+    trainer_pid: int | None = None,
+    worker_pids: Iterable[int] = (),
+) -> dict[str, object]:
+    """Trainer, per-worker (min/median/mean/p90/max), aggregate, and tree RSS.
+
+    Also reports per-worker USS (private memory) when the platform supports it
+    - this is what the shared memory-mapped dataset actually reduces.
+    """
+    root_pid = os.getpid() if trainer_pid is None else int(trainer_pid)
+    pids = [int(p) for p in worker_pids if int(p) != root_pid]
+    psutil = _psutil_module()
+    if psutil is None:
+        return {"psutil_available": "no"}
+
+    trainer_rss = process_rss_mb(root_pid) or 0.0
+    worker_rss = [r for r in (process_rss_mb(p) for p in pids) if r is not None]
+    worker_uss = [u for u in (process_uss_mb(p) for p in pids) if u is not None]
+
+    if worker_rss:
+        worker_rss_sorted = sorted(worker_rss)
+        n = len(worker_rss_sorted)
+        median = (
+            worker_rss_sorted[n // 2]
+            if n % 2
+            else ((worker_rss_sorted[n // 2 - 1] + worker_rss_sorted[n // 2]) / 2)
+        )
+        worker_stats = {
+            "worker_rss_min_mb": round(worker_rss_sorted[0], 1),
+            "worker_rss_median_mb": round(median, 1),
+            "worker_rss_mean_mb": round(sum(worker_rss) / n, 1),
+            "worker_rss_p90_mb": round(worker_rss_sorted[min(n - 1, int(0.9 * n))], 1),
+            "worker_rss_max_mb": round(worker_rss_sorted[-1], 1),
+            "worker_rss_aggregate_mb": round(sum(worker_rss), 1),
+        }
+    else:
+        worker_stats = {
+            "worker_rss_min_mb": 0.0,
+            "worker_rss_median_mb": 0.0,
+            "worker_rss_mean_mb": 0.0,
+            "worker_rss_p90_mb": 0.0,
+            "worker_rss_max_mb": 0.0,
+            "worker_rss_aggregate_mb": 0.0,
+        }
+
+    tree_rss = trainer_rss
+    for p in [*pids, *_children_pids(psutil, root_pid)]:
+        r = process_rss_mb(p)
+        if r is not None:
+            tree_rss += r
+
+    return {
+        "psutil_available": "yes",
+        "trainer_rss_mb": round(trainer_rss, 1),
+        "worker_rss_count": len(worker_rss),
+        **worker_stats,
+        "worker_uss_aggregate_mb": round(sum(worker_uss), 1) if worker_uss else None,
+        "worker_uss_median_mb": round(float(np_median(worker_uss)), 1) if worker_uss else None,
+        "process_tree_rss_mb": round(tree_rss, 1),
+    }
+
+
+def _children_pids(psutil: Any, root_pid: int) -> list[int]:
+    try:
+        root = psutil.Process(root_pid)
+        return [int(c.pid) for c in root.children(recursive=True)]
+    except Exception:
+        return []
+
+
+def np_median(values: list[float]) -> float:
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    if n % 2:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def print_memory_report(
+    *,
+    trainer_pid: int | None = None,
+    worker_pids: Iterable[int] = (),
+    workers_configured: int | None = None,
+    label: str = "MEMORY",
+) -> dict[str, object]:
+    report = memory_report(trainer_pid=trainer_pid, worker_pids=worker_pids)
+    if report.get("psutil_available") == "no":
+        print(f"{label}: psutil unavailable (install psutil to measure memory)")
+        return report
+    print("=" * 60)
+    print(label)
+    print("=" * 60)
+    print(f"Trainer RSS: {report['trainer_rss_mb']} MB")
+    if workers_configured is not None:
+        print(f"Workers configured: {workers_configured}")
+    print(f"Workers measured (RSS): {report['worker_rss_count']}")
+    print(f"  worker RSS min    : {report['worker_rss_min_mb']} MB")
+    print(f"  worker RSS median : {report['worker_rss_median_mb']} MB")
+    print(f"  worker RSS mean   : {report['worker_rss_mean_mb']} MB")
+    print(f"  worker RSS p90    : {report['worker_rss_p90_mb']} MB")
+    print(f"  worker RSS max    : {report['worker_rss_max_mb']} MB")
+    print(f"  worker RSS aggregate: {report['worker_rss_aggregate_mb']} MB")
+    uss_agg = report.get("worker_uss_aggregate_mb")
+    uss_med = report.get("worker_uss_median_mb")
+    if uss_agg is not None:
+        print(f"  worker USS aggregate (private): {uss_agg} MB")
+        print(f"  worker USS median (private)   : {uss_med} MB")
+    print(f"Process-tree RSS: {report['process_tree_rss_mb']} MB")
+    print("=" * 60)
+    return report

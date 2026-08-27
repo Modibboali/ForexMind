@@ -36,7 +36,6 @@ from forexmind.training.config import ExperimentConfig, TrainingEnvConfig
 from forexmind.training.data import (
     DEFAULT_INSTRUMENT_ORDER,
     DEFAULT_PROCESSED_DIR,
-    make_training_dataset,
 )
 from forexmind.training.metrics import (
     MetricStore,
@@ -98,12 +97,15 @@ class BaseTrainer(ABC):
         if dataset is not None:
             self.dataset = dataset
         else:
-            self.dataset = make_training_dataset(
+            from forexmind.training.dataset_mmap import resolve_dataset
+
+            self.dataset, self.dataset_backend = resolve_dataset(
                 processed_dir=processed_dir,
                 split_config=None,
                 instruments=tuple(config.environment.instruments)
                 if config.environment.instruments
                 else DEFAULT_INSTRUMENT_ORDER,
+                backend=config.compute.dataset_backend,
             )
         self.env_config = build_env_config(config.environment)
         self.encoder = ObservationEncoder(
@@ -122,7 +124,10 @@ class BaseTrainer(ABC):
         self.obs_dim = self.encoder.config.spec.encoded_shape[0]
         self.action_dim = 1
 
+        self._resolve_worker_count()
+
         self.collector = self._build_collector()
+        self._warn_memory_budget()
         self._producer_worker_ids: set[int] = set()
         self._cpu_sampler = self._make_cpu_sampler()
         self.metric_store = MetricStore()
@@ -172,6 +177,80 @@ class BaseTrainer(ABC):
             print("  !! learner_device=cuda requested but CUDA unavailable; using cpu")
             return torch.device("cpu")
         return torch.device(name)
+
+    # -- memory planning ------------------------------------------------------
+
+    def _estimate_worker_rss_mb(self) -> float:
+        """Estimated per-worker private RSS by dataset backend.
+
+        With ``parquet`` every worker materialises the full dataset privately
+        (dataset_summary's estimate + process overhead).  With ``mmap`` the
+        data pages are shared by the OS, so each worker's *private* footprint
+        is small (torch/pandas/env/rollout only).
+        """
+        backend = getattr(self, "dataset_backend", "parquet")
+        if backend == "mmap":
+            return 400.0  # private per-worker footprint (shared data excluded)
+        from forexmind.training.data import dataset_summary
+
+        data_mb = _to_float(dataset_summary(self.dataset).get("estimated_memory_mb"), 0.0)
+        return data_mb + 400.0  # dataset copy + worker overhead
+
+    def _resolve_worker_count(self) -> None:
+        """Resolve ``compute.num_workers`` to a concrete int (handles "auto")."""
+        from forexmind.training.memory_planning import (
+            estimate_auto_worker_count,
+            total_ram_mb,
+        )
+
+        cfg = self.config.compute
+        if cfg.num_workers == "auto":
+            n = estimate_auto_worker_count(
+                worker_rss_mb=self._estimate_worker_rss_mb(),
+                memory_limit_fraction=cfg.memory_limit_fraction or 0.70,
+            )
+            self._resolved_num_workers = n
+            print(
+                f"[memory] num_workers=auto -> {n} "
+                f"(RAM {total_ram_mb() / 1000:.0f} GB, "
+                f"fraction {cfg.memory_limit_fraction or 0.70:.2f}, "
+                f"est worker {self._estimate_worker_rss_mb():.0f} MB)"
+            )
+        else:
+            self._resolved_num_workers = int(cfg.num_workers)
+
+    def _warn_memory_budget(self) -> None:
+        """Warn when the estimated process-tree RAM exceeds the budget fraction."""
+        from forexmind.training.memory_planning import (
+            estimate_process_tree_mb,
+            total_ram_mb,
+        )
+
+        cfg = self.config.compute
+        if cfg.memory_limit_fraction is None:
+            return
+        ram_mb = total_ram_mb()
+        if ram_mb <= 0:
+            return
+        worker_mb = self._estimate_worker_rss_mb()
+        est_tree_mb = estimate_process_tree_mb(
+            worker_rss_mb=worker_mb,
+            workers=self._resolved_num_workers,
+        )
+        limit_mb = cfg.memory_limit_fraction * ram_mb
+        print(
+            f"[memory] est process-tree ~{est_tree_mb:.0f} MB "
+            f"(workers={self._resolved_num_workers} x {worker_mb:.0f} MB + reserve) "
+            f"vs budget {limit_mb:.0f} MB "
+            f"({cfg.memory_limit_fraction:.0%} of {ram_mb / 1000:.0f} GB)"
+        )
+        if est_tree_mb > limit_mb:
+            print(
+                f"  !! WARNING: estimated process-tree memory {est_tree_mb:.0f} MB "
+                f"exceeds the {cfg.memory_limit_fraction:.0%} budget "
+                f"({limit_mb:.0f} MB). Reduce compute.num_workers or set "
+                f"compute.dataset_backend to 'mmap' (shared dataset store)."
+            )
 
     # -- collector ------------------------------------------------------------
 
@@ -226,9 +305,10 @@ class BaseTrainer(ABC):
                 obs_dim=self.obs_dim,
                 action_dim=self.action_dim,
                 global_seed=cfg.compute.seed,
-                num_workers=cfg.compute.num_workers,
+                num_workers=self._resolved_num_workers,
                 log_std_min=cfg.training.log_std_min,
                 log_std_max=cfg.training.log_std_max,
+                dataset_backend=cfg.compute.dataset_backend,
             )
         worker = EnvWorker(
             dataset=self.dataset,
@@ -565,23 +645,35 @@ class BaseTrainer(ABC):
                     f"{self.config.training.log_std_max}] "
                     f"finite_check={self.config.training.finite_check}"
                 ),
+                "Dataset backend": getattr(self, "dataset_backend", "unknown"),
             },
+        )
+        from forexmind.training.runtime_diagnostics import print_memory_report
+
+        print_memory_report(
+            worker_pids=worker_pids,
+            workers_configured=self._resolved_num_workers,
+            label="STARTUP MEMORY",
         )
 
     # -- finalization ---------------------------------------------------------
 
     def finalize(self) -> dict[str, Any]:
-        from forexmind.training.runtime_diagnostics import print_process_tree_report
+        from forexmind.training.runtime_diagnostics import (
+            memory_report,
+            print_memory_report,
+            print_process_tree_report,
+        )
 
-        # Capture the final process-tree CPU sample BEFORE closing workers
-        # (once workers are joined their CPU percent is gone).
+        # Capture the final process-tree CPU AND memory sample BEFORE closing
+        # workers (once workers are joined their CPU/RSS is gone).
         cpu_report: dict[str, object] = {}
         sampler = self._cpu_sampler
         if sampler is not None and sampler.has_procs:
             cpu_report = dict(sampler.stop())
             print_process_tree_report(
                 worker_pids=getattr(self.collector, "worker_pids", []),
-                workers_configured=self.config.compute.num_workers
+                workers_configured=self._resolved_num_workers
                 if self.config.compute.collect_backend == "process"
                 else 0,
                 sample_seconds=0.0,
@@ -589,6 +681,19 @@ class BaseTrainer(ABC):
                 producer_ids=self._producer_worker_ids,
                 label="FINAL PROCESS TREE",
             )
+        mem_report = dict(
+            memory_report(
+                trainer_pid=os.getpid(),
+                worker_pids=getattr(self.collector, "worker_pids", []),
+            )
+        )
+        print_memory_report(
+            worker_pids=getattr(self.collector, "worker_pids", []),
+            workers_configured=self._resolved_num_workers
+            if self.config.compute.collect_backend == "process"
+            else 0,
+            label="FINAL MEMORY",
+        )
         workers_alive = getattr(self.collector, "alive_workers", 0)
         self.collector.close()
         if self.best_checkpoint is None:
@@ -611,9 +716,14 @@ class BaseTrainer(ABC):
             "best_validation_score": self.best_score,
             "wall_seconds": round(wall, 2),
             "steps_per_second": round(self._env_steps / wall, 1) if wall > 0 else 0.0,
-            "workers_configured": self.config.compute.num_workers,
+            "workers_configured": self._resolved_num_workers,
             "workers_alive_at_finalize": workers_alive,
             "workers_producing_transitions": len(self._producer_worker_ids),
+            "dataset_backend": getattr(self, "dataset_backend", "unknown"),
+            "trainer_rss_mb": mem_report.get("trainer_rss_mb", 0.0),
+            "worker_rss_aggregate_mb": mem_report.get("worker_rss_aggregate_mb", 0.0),
+            "worker_uss_aggregate_mb": mem_report.get("worker_uss_aggregate_mb"),
+            "process_tree_rss_mb": mem_report.get("process_tree_rss_mb", 0.0),
             "trainer_cpu_percent": cpu_report.get("trainer_cpu_percent", 0.0),
             "worker_cpu_percent": cpu_report.get("worker_cpu_percent", 0.0),
             "process_tree_cpu_percent": cpu_report.get("process_tree_cpu_percent", 0.0),
