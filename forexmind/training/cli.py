@@ -23,24 +23,52 @@ TRAINER_REGISTRY = {
 
 
 def add_common_args(parser: argparse.ArgumentParser, algorithm: str) -> None:
-    parser.add_argument("--config", type=str, default=None,
-                        help="Path to a YAML experiment config (overrides defaults).")
-    parser.add_argument("--resume", type=str, default=None,
-                        help="Checkpoint path to resume from.")
-    parser.add_argument("--seeds", type=int, nargs="+", default=None,
-                        help="One or more seeds (each runs an independent training).")
-    parser.add_argument("--run-id", type=str, default="",
-                        help="Short label embedded in the run directory name.")
-    parser.add_argument("--workers", type=int, default=None,
-                        help="Override environment worker processes.")
-    parser.add_argument("--total-env-steps", type=int, default=None,
-                        help="Override total environment steps.")
-    parser.add_argument("--backend", type=str, default=None,
-                        help="Override collect backend ('sync' | 'process').")
-    parser.add_argument("--run-root", type=str, default=None,
-                        help="Root directory for runs (default: config run_dir).")
-    parser.add_argument("--algorithm", type=str, default=algorithm,
-                        help="Algorithm name (sac|ppo); must match module.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to a YAML experiment config (overrides defaults).",
+    )
+    parser.add_argument("--resume", type=str, default=None, help="Checkpoint path to resume from.")
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="One or more seeds (each runs an independent training).",
+    )
+    parser.add_argument(
+        "--run-id", type=str, default="", help="Short label embedded in the run directory name."
+    )
+    parser.add_argument(
+        "--workers", type=int, default=None, help="Override environment worker processes."
+    )
+    parser.add_argument(
+        "--total-env-steps", type=int, default=None, help="Override total environment steps."
+    )
+    parser.add_argument(
+        "--max-env-steps",
+        type=int,
+        default=None,
+        dest="max_env_steps",
+        help="Alias for --total-env-steps: stop after N env steps "
+        "(useful to binary-search the first unstable region).",
+    )
+    parser.add_argument(
+        "--backend", type=str, default=None, help="Override collect backend ('sync' | 'process')."
+    )
+    parser.add_argument(
+        "--run-root",
+        type=str,
+        default=None,
+        help="Root directory for runs (default: config run_dir).",
+    )
+    parser.add_argument(
+        "--algorithm",
+        type=str,
+        default=algorithm,
+        help="Algorithm name (sac|ppo); must match module.",
+    )
 
 
 def load_config(args: argparse.Namespace, algorithm: str) -> ExperimentConfig:
@@ -54,8 +82,9 @@ def load_config(args: argparse.Namespace, algorithm: str) -> ExperimentConfig:
         cfg = replace(cfg, algorithm=type(cfg.algorithm)(name=algorithm))
     if args.workers is not None:
         cfg = replace(cfg, compute=replace(cfg.compute, num_workers=args.workers))
-    if args.total_env_steps is not None:
-        cfg = replace(cfg, training=replace(cfg.training, total_env_steps=args.total_env_steps))
+    if args.total_env_steps is not None or args.max_env_steps is not None:
+        cap = args.total_env_steps if args.total_env_steps is not None else args.max_env_steps
+        cfg = replace(cfg, training=replace(cfg.training, total_env_steps=cap))
     if args.backend:
         cfg = replace(cfg, compute=replace(cfg.compute, collect_backend=args.backend))
     return cfg
@@ -93,16 +122,13 @@ def train_one(
     return summary
 
 
-def run_multiseed(
-    args: argparse.Namespace, algorithm: str
-) -> list[dict[str, object]]:
+def run_multiseed(args: argparse.Namespace, algorithm: str) -> list[dict[str, object]]:
     config = load_config(args, algorithm)
     seeds = args.seeds if args.seeds else [config.compute.seed]
     summaries: list[dict[str, object]] = []
     t0 = time.perf_counter()
     for i, seed in enumerate(seeds):
-        print(f"\n>>> {algorithm.upper()} training | seed {seed} "
-              f"({i + 1}/{len(seeds)})")
+        print(f"\n>>> {algorithm.upper()} training | seed {seed} ({i + 1}/{len(seeds)})")
         summary = train_one(config, seed, resume=args.resume, run_root=args.run_root)
         summaries.append(summary)
         print(json.dumps(summary, indent=2, default=str))

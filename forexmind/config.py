@@ -186,10 +186,19 @@ class RewardConfig:
     ``reward_type``: ``"log_equity_return"`` (default) computes
     ``ln(equity_{t+1} / equity_t)``.  Extensible for later experiments
     (risk-adjusted, drawdown-penalised, cost-penalised).
+
+    ``min_reward`` / ``max_reward`` are *numerical-stability* bounds, not a
+    change to the trading problem: when equity collapses to ``<= 0`` the log
+    return is ``-inf`` (unusable for gradient-based RL - it poisons GAE and
+    advantage normalization into NaN), so the reward service returns the
+    finite ``min_reward`` floor instead.  ``max_reward`` is ``None`` by default
+    (no ceiling).
     """
 
     reward_type: str = "log_equity_return"
     risk_free_rate: Decimal = field(default_factory=lambda: Decimal("0"))
+    min_reward: float = -50.0  # finite floor replacing -inf on equity collapse
+    max_reward: float | None = None  # optional finite ceiling
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +249,8 @@ def default_config(
     commission_per_unit: float = 0.0,
     sizing_mode: str = "equity_fraction",
     fixed_units: float | str | Decimal = "100000",
+    min_reward: float = -50.0,
+    max_reward: float | None = None,
 ) -> EnvironmentConfig:
     """Convenience factory for a sensible default Phase-1 configuration."""
     return EnvironmentConfig(
@@ -252,4 +263,5 @@ def default_config(
         ),
         margin=MarginConfig(initial_balance=_dec(initial_balance), leverage=_dec(leverage)),
         sizing=PositionSizingConfig(mode=sizing_mode, fixed_units=_dec(fixed_units)),
+        reward=RewardConfig(min_reward=min_reward, max_reward=max_reward),
     )

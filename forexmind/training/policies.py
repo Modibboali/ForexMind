@@ -17,16 +17,33 @@ from torch import nn
 from forexmind.environment.actions import Action
 from forexmind.observation.schema import EncodedObservation
 from forexmind.training.config import ModelConfig
-from forexmind.training.networks import GaussianPolicy, SquashedGaussianActor
+from forexmind.training.networks import (
+    LOG_STD_MAX,
+    LOG_STD_MIN,
+    GaussianPolicy,
+    SquashedGaussianActor,
+)
 
 
 def build_policy_network(
-    algorithm: str, obs_dim: int, action_dim: int, model: ModelConfig
+    algorithm: str,
+    obs_dim: int,
+    action_dim: int,
+    model: ModelConfig,
+    *,
+    log_std_min: float | None = None,
+    log_std_max: float | None = None,
 ) -> nn.Module:
     if algorithm == "sac":
         return SquashedGaussianActor(obs_dim, action_dim, model)
     if algorithm == "ppo":
-        return GaussianPolicy(obs_dim, action_dim, model)
+        return GaussianPolicy(
+            obs_dim,
+            action_dim,
+            model,
+            log_std_min=LOG_STD_MIN if log_std_min is None else log_std_min,
+            log_std_max=LOG_STD_MAX if log_std_max is None else log_std_max,
+        )
     raise ValueError(f"unsupported algorithm {algorithm!r}; use 'sac' or 'ppo'")
 
 
@@ -43,11 +60,7 @@ def sample_action(
     obs = torch.as_tensor(np.asarray(obs_flat, dtype=np.float32), device=device).unsqueeze(0)
     if algorithm == "sac":
         sac_policy = cast(SquashedGaussianActor, policy)
-        action = (
-            sac_policy.deterministic(obs)
-            if deterministic
-            else sac_policy.sample(obs)[0]
-        )
+        action = sac_policy.deterministic(obs) if deterministic else sac_policy.sample(obs)[0]
     elif algorithm == "ppo":
         ppo_policy = cast(GaussianPolicy, policy)
         action = ppo_policy.act(obs, deterministic=deterministic)
@@ -82,7 +95,10 @@ class PolicyAgent:
 
     def act(self, observation: EncodedObservation) -> Action:
         action = sample_action(
-            self.policy, observation.encoded, self.algorithm, deterministic=True,
+            self.policy,
+            observation.encoded,
+            self.algorithm,
+            deterministic=True,
             device=self._device,
         )
         return Action(action)

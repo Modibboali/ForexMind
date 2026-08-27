@@ -94,19 +94,32 @@ class TwinQCritic(nn.Module):
         self.q1 = MLP(obs_dim + action_dim, 1, config)
         self.q2 = MLP(obs_dim + action_dim, 1, config)
 
-    def forward(
-        self, obs: torch.Tensor, action: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = torch.cat([obs, action], dim=-1)
         return self.q1(x), self.q2(x)
 
 
 class GaussianPolicy(nn.Module):
-    """PPO Gaussian policy (mean + learned log-std), continuous actions."""
+    """PPO Gaussian policy (mean + learned log-std), continuous actions.
 
-    def __init__(self, obs_dim: int, action_dim: int, config: ModelConfig) -> None:
+    The action is a clamped Gaussian sample (clamped to [-1, 1] at execution).
+    ``log_std`` is a single learned parameter bounded to ``[log_std_min,
+    log_std_max]`` so ``exp(log_std)`` cannot silently overflow.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        config: ModelConfig,
+        *,
+        log_std_min: float = LOG_STD_MIN,
+        log_std_max: float = LOG_STD_MAX,
+    ) -> None:
         super().__init__()
         self.action_dim = action_dim
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
         self.mean_net = MLP(obs_dim, action_dim, config)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
@@ -115,7 +128,7 @@ class GaussianPolicy(nn.Module):
 
     def dist(self, obs: torch.Tensor) -> torch.distributions.Normal:
         mean = self.mean_net(obs)
-        log_std = self.log_std.expand_as(mean).clamp(LOG_STD_MIN, LOG_STD_MAX)
+        log_std = self.log_std.expand_as(mean).clamp(self.log_std_min, self.log_std_max)
         return torch.distributions.Normal(mean, log_std.exp())
 
     def act(self, obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
@@ -126,10 +139,13 @@ class GaussianPolicy(nn.Module):
     def evaluate(
         self, obs: torch.Tensor, action: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Plain Gaussian density on the (clamped) action.  No tanh-squash
+        # correction: the action is clamped, not tanh-squashed, so applying a
+        # tanh Jacobian correction here would be inconsistent with the density
+        # used during the PPO update.
         dist = self.dist(obs)
         raw_action = torch.clamp(action, -1.0 + 1e-6, 1.0 - 1e-6)
-        # Approximate squashed density so actions stay in [-1, 1].
-        log_prob = dist.log_prob(raw_action) - torch.log(1.0 - raw_action.pow(2) + 1e-6)
+        log_prob = dist.log_prob(raw_action)
         return log_prob.sum(-1, keepdim=True), dist.entropy().sum(-1, keepdim=True)
 
 

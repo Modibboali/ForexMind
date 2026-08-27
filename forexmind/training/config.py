@@ -50,6 +50,14 @@ class TrainingConfig:
     ppo_entropy_coef: float = 0.01
     ppo_value_coef: float = 0.5
     gae_lambda: float = 0.95
+    # PPO numerical stability (see docs/ppo_numerical_stability_audit.md)
+    actor_lr: float | None = None  # None -> learning_rate
+    critic_lr: float | None = None  # None -> learning_rate
+    max_grad_norm: float = 0.5  # 0.0 disables gradient clipping
+    log_std_min: float = -5.0  # bounds for the PPO Gaussian log-std
+    log_std_max: float = 2.0
+    adv_epsilon: float = 1e-8  # advantage-normalization denominator floor
+    finite_check: bool = False  # raise FiniteError at the first non-finite value
     # Worker policy sync
     policy_sync_interval: int = 10_000  # env steps between worker policy updates
 
@@ -65,6 +73,10 @@ class TrainingEnvConfig:
     commission: float = 0.0
     sizing_mode: str = "equity_fraction"
     instruments: tuple[str, ...] = ()  # empty = all available instruments
+    # Numerical-stability reward bounds (see RewardConfig): the finite floor
+    # replaces -inf on equity collapse so PPO GAE/normalization cannot NaN.
+    min_reward: float = -50.0
+    max_reward: float | None = None
 
 
 @dataclass
@@ -72,6 +84,7 @@ class ComputeConfig:
     num_workers: int = 4  # environment worker processes (independent of learner)
     learner_device: str = "cpu"  # "cpu" | "cuda"
     torch_threads: int = 2  # learner BLAS threads (prevent oversubscription)
+    torch_interop_threads: int | None = None  # None = leave torch default
     collect_backend: str = "sync"  # "sync" (deterministic, in-process) | "process"
     seed: int = 42
 
@@ -169,16 +182,31 @@ class ExperimentConfig:
                 policy_sync_interval=200,
             ),
             environment=TrainingEnvConfig(
-                split="train", context_length=8, horizon=16, initial_balance="10000",
-                leverage=50.0, spread=0.0002, sizing_mode="equity_fraction",
+                split="train",
+                context_length=8,
+                horizon=16,
+                initial_balance="10000",
+                leverage=50.0,
+                spread=0.0002,
+                sizing_mode="equity_fraction",
                 instruments=("EURUSD",),
             ),
-            compute=ComputeConfig(num_workers=1, learner_device="cpu", torch_threads=1,
-                                  collect_backend="sync", seed=42),
-            logging=LoggingConfig(log_every_env_steps=500, evaluate_every_env_steps=1000,
-                                  checkpoint_every_env_steps=1000, run_dir="runs_smoke"),
-            evaluation=EvalConfig(validation_episodes=2, test_episodes=2, eval_horizon=16,
-                                  eval_seed=42),
+            compute=ComputeConfig(
+                num_workers=1,
+                learner_device="cpu",
+                torch_threads=1,
+                collect_backend="sync",
+                seed=42,
+            ),
+            logging=LoggingConfig(
+                log_every_env_steps=500,
+                evaluate_every_env_steps=1000,
+                checkpoint_every_env_steps=1000,
+                run_dir="runs_smoke",
+            ),
+            evaluation=EvalConfig(
+                validation_episodes=2, test_episodes=2, eval_horizon=16, eval_seed=42
+            ),
         )
 
 

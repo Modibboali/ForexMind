@@ -1,0 +1,93 @@
+# ForexMind Phase 3 — PPO numerical-stability validation config.
+#
+# Conservative PPO configuration for the 1M-step validation run
+# (docs/ppo_numerical_stability_audit.md, sections 23-25).  Every change here
+# is a *justified* numerical-stability control; the trading problem
+# (reward, action semantics, execution, splits, observation) is untouched:
+#
+#   min_reward:   finite floor replacing -inf on equity collapse (was the
+#                 first Inf source; -inf poisoned GAE -> NaN advantages ->
+#                 NaN gradients -> NaN actor mean -> Normal(loc=nan) crash).
+#   actor_lr / critic_lr: independent, conservative 3e-4.
+#   max_grad_norm: 0.5 gradient clipping for actor and critic (was none).
+#   log_std bounds [-5, 2]: keeps exp(log_std) finite (std in [0.007, 7.4]).
+#   ppo_epochs: 5 (was 10) - less policy drift per rollout (lower KL).
+#   finite_check: true - raises FiniteError at the FIRST non-finite value so
+#                 this validation run proves no NaN/Inf/explosion.
+#   torch_interop_threads: 2 (was torch default ~112 on Kaggle) - resource
+#                 hygiene; NOT a NaN fix, see audit section 21.
+#
+# Launch:
+#   python -m forexmind.training.train_ppo --config configs/ppo_stable.yaml --seeds 1
+algorithm:
+  name: ppo
+
+model:
+  hidden_dim: 256
+  num_layers: 2
+  activation: relu
+
+training:
+  total_env_steps: 1000000
+  batch_size: 256
+  replay_capacity: 0
+  warmup_steps: 0
+  gradient_updates_per_step: 1
+  collect_batch: 4096
+  gamma: 0.99
+  tau: 0.005
+  learning_rate: 0.0003
+  actor_lr: 0.0003
+  critic_lr: 0.0003
+  max_grad_norm: 0.5
+  log_std_min: -5.0
+  log_std_max: 2.0
+  adv_epsilon: 1.0e-8
+  finite_check: true
+  alpha: auto
+  ppo_epochs: 5
+  ppo_clip_epsilon: 0.2
+  ppo_entropy_coef: 0.01
+  ppo_value_coef: 0.5
+  gae_lambda: 0.95
+  policy_sync_interval: 0
+
+environment:
+  split: train
+  context_length: 64
+  horizon: 512
+  initial_balance: "10000"
+  leverage: 50.0
+  spread: 0.0002
+  commission: 0.0
+  sizing_mode: equity_fraction
+  instruments: []
+  min_reward: -50.0
+  max_reward: null
+
+compute:
+  num_workers: 102
+  learner_device: cpu
+  torch_threads: 2
+  torch_interop_threads: 2
+  collect_backend: process
+  seed: 42
+
+logging:
+  log_every_env_steps: 100000
+  evaluate_every_env_steps: 500000
+  checkpoint_every_env_steps: 500000
+  run_dir: runs
+
+evaluation:
+  validation_episodes: 100
+  test_episodes: 100
+  eval_horizon: 512
+  eval_seed: 42
+
+selection:
+  metric: sharpe_drawdown
+  lambda_drawdown: 1.0
+
+run_id: ppo_stable
+dataset_version: processed-parquet-2026

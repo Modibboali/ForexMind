@@ -49,6 +49,9 @@ class Transition:
     next_value: float = 0.0
     worker_id: int = -1
     worker_pid: int = 0
+    # Diagnostic-only provenance for the first-non-finite audit.
+    instrument: str = ""
+    timestamp: object | None = None
 
 
 def worker_episode_seed(global_seed: int, worker_id: int, episode_index: int) -> int:
@@ -112,9 +115,7 @@ class EnvWorker:
 
             ds = MarketDataset()
             ds.add(self.dataset.load(instrument))
-            self._envs[instrument] = ForexEnvironment(
-                ds, self.env_config, instrument=instrument
-            )
+            self._envs[instrument] = ForexEnvironment(ds, self.env_config, instrument=instrument)
         return self._envs[instrument]
 
     def _make_builder(self, instrument: str) -> MarketWindowBuilder:
@@ -174,10 +175,15 @@ class EnvWorker:
                     dist = gauss(obs_t)
                     raw = dist.sample()
                     action = torch.clamp(raw, -1.0, 1.0)
-                    log_prob = float(gauss.evaluate(obs_t, action)[0].item())
-                    value = (
-                        float(value_net(obs_t).item()) if value_net is not None else 0.0
-                    )
+                    # Consistent with the trainer's ``update``: the stored
+                    # log-prob is the raw Gaussian density evaluated at the
+                    # (clamped) action.  The action is CLAMPED, not
+                    # tanh-squashed, so the tanh Jacobian correction must NOT
+                    # be applied here (it was - a mismatch that made
+                    # ``ratio = exp(new_logp - old_logp)`` systematically
+                    # wrong and could drive ratios toward overflow).
+                    log_prob = float(dist.log_prob(action).sum().item())
+                    value = float(value_net(obs_t).item()) if value_net is not None else 0.0
                     action_f = float(action.item())
                 else:
                     action_f = float(sample_action(policy, last_obs, self.algorithm))
@@ -204,6 +210,8 @@ class EnvWorker:
             next_value=next_value,
             worker_id=self.worker_id,
             worker_pid=os.getpid(),
+            instrument=str(obs.instrument) if obs.instrument else "",
+            timestamp=obs.timestamp,
         )
         self._active = (env, builder, _spec, next_obs)
         self._total_steps += 1
@@ -238,9 +246,7 @@ class SyncCollector:
 # ---------------------------------------------------------------------------
 
 
-def _worker_process_main(
-    cfg: dict[str, Any], q_in: Any, q_out: Any
-) -> None:  # pragma: no cover
+def _worker_process_main(cfg: dict[str, Any], q_in: Any, q_out: Any) -> None:  # pragma: no cover
     """Subprocess entry: rebuild worker from a picklable config dict."""
     worker_id = int(cfg["worker_id"])
     print(
@@ -249,16 +255,21 @@ def _worker_process_main(
         flush=True,
     )
     split_config = SplitConfig.from_dict(cfg["split_config"])
-    dataset = make_training_dataset(
-        cfg["processed_dir"], split_config, tuple(cfg["instruments"])
-    )
+    dataset = make_training_dataset(cfg["processed_dir"], split_config, tuple(cfg["instruments"]))
     env_config = cfg["env_config"]
     encoder_config = cfg["encoder_config"]
     window_config = cfg["window_config"]
     episode_config = cfg["episode_config"]
     model = cfg["model"]
     algorithm = cfg["algorithm"]
-    policy = build_policy_network(algorithm, cfg["obs_dim"], cfg["action_dim"], model)
+    policy = build_policy_network(
+        algorithm,
+        cfg["obs_dim"],
+        cfg["action_dim"],
+        model,
+        log_std_min=cfg.get("log_std_min"),
+        log_std_max=cfg.get("log_std_max"),
+    )
     policy.eval()
     value_net = None
     if algorithm == "ppo":
@@ -289,13 +300,9 @@ def _worker_process_main(
             break
         kind = msg[0]
         if kind == "set_policy":
-            policy.load_state_dict(
-                {k: torch.as_tensor(v) for k, v in msg[1].items()}
-            )
+            policy.load_state_dict({k: torch.as_tensor(v) for k, v in msg[1].items()})
             if value_net is not None and len(msg) > 2 and msg[2] is not None:
-                value_net.load_state_dict(
-                    {k: torch.as_tensor(v) for k, v in msg[2].items()}
-                )
+                value_net.load_state_dict({k: torch.as_tensor(v) for k, v in msg[2].items()})
         elif kind == "collect":
             n = int(msg[1])
             random_action = bool(msg[2])
@@ -326,6 +333,8 @@ class ProcessCollector:
         action_dim: int,
         global_seed: int,
         num_workers: int,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
     ) -> None:
         self.num_workers = max(1, num_workers)
         ctx = mp.get_context("spawn")
@@ -346,6 +355,8 @@ class ProcessCollector:
             "obs_dim": obs_dim,
             "action_dim": action_dim,
             "global_seed": global_seed,
+            "log_std_min": log_std_min,
+            "log_std_max": log_std_max,
         }
         for wid in range(self.num_workers):
             q_in = ctx.Queue()

@@ -58,6 +58,8 @@ def build_env_config(env_cfg: TrainingEnvConfig) -> EnvironmentConfig:
         spread_value=env_cfg.spread,
         commission_per_unit=env_cfg.commission,
         sizing_mode=env_cfg.sizing_mode,
+        min_reward=env_cfg.min_reward,
+        max_reward=env_cfg.max_reward,
     )
 
 
@@ -79,6 +81,16 @@ class BaseTrainer(ABC):
         np.random.seed(config.compute.seed)
         self.device = self._resolve_device(config.compute.learner_device)
         torch.set_num_threads(max(1, config.compute.torch_threads))
+        interop = config.compute.torch_interop_threads
+        if interop is not None:
+            # Must be set before any parallel torch work is initialised.
+            # torch defaults interop threads to the physical core count (e.g.
+            # 112 on Kaggle) which can oversubscribe alongside worker
+            # processes; making it configurable lets the launcher cap it.
+            try:
+                torch.set_num_interop_threads(max(1, int(interop)))
+            except RuntimeError as exc:  # pragma: no cover - pool already started
+                print(f"  !! could not set torch interop threads to {interop}: {exc}")
         os.environ.setdefault("OMP_NUM_THREADS", str(max(1, config.compute.torch_threads)))
         os.environ.setdefault("MKL_NUM_THREADS", str(max(1, config.compute.torch_threads)))
         os.environ.setdefault("OPENBLAS_NUM_THREADS", str(max(1, config.compute.torch_threads)))
@@ -215,6 +227,8 @@ class BaseTrainer(ABC):
                 action_dim=self.action_dim,
                 global_seed=cfg.compute.seed,
                 num_workers=cfg.compute.num_workers,
+                log_std_min=cfg.training.log_std_min,
+                log_std_max=cfg.training.log_std_max,
             )
         worker = EnvWorker(
             dataset=self.dataset,
@@ -540,6 +554,17 @@ class BaseTrainer(ABC):
                 "OPENBLAS_NUM_THREADS": thread_env["OPENBLAS_NUM_THREADS"],
                 "Worker PIDs": worker_pids,
                 "Alive workers": alive_workers,
+                "Learning config": (
+                    f"lr={self.config.training.learning_rate} "
+                    "actor_lr="
+                    f"{self.config.training.actor_lr or self.config.training.learning_rate} "
+                    "critic_lr="
+                    f"{self.config.training.critic_lr or self.config.training.learning_rate} "
+                    f"max_grad_norm={self.config.training.max_grad_norm} "
+                    f"log_std=[{self.config.training.log_std_min},"
+                    f"{self.config.training.log_std_max}] "
+                    f"finite_check={self.config.training.finite_check}"
+                ),
             },
         )
 

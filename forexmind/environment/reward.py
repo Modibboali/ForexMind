@@ -19,6 +19,14 @@ from forexmind.config import RewardConfig, _dec
 class RewardService:
     def __init__(self, config: RewardConfig) -> None:
         self.config = config
+        # Diagnostic: number of equity-collapse events mapped to the finite
+        # reward floor instead of -inf (see RewardConfig.min_reward).
+        self._collapse_count = 0
+
+    @property
+    def collapse_count(self) -> int:
+        """Number of times ``curr_equity <= 0`` mapped to the finite floor."""
+        return self._collapse_count
 
     def reward(
         self,
@@ -34,12 +42,16 @@ class RewardService:
             f"unsupported reward_type {self.config.reward_type!r}; use 'log_equity_return'"
         )
 
-    @staticmethod
-    def _log_return(prev: Decimal, curr: Decimal) -> float:
+    def _log_return(self, prev: Decimal, curr: Decimal) -> float:
         if prev <= 0:
             raise ValueError(f"prev_equity must be > 0 for log return, got {prev}")
         if curr <= 0:
-            # Equity collapsed (e.g. liquidation wipe-out); represent as a large
-            # negative return, matching the log-return limit.
-            return float("-inf")
+            # Equity collapsed (e.g. liquidation wipe-out).  The log-return
+            # limit is -inf, but -inf is unusable for gradient-based RL: it
+            # poisons GAE deltas and advantage normalization into NaN.  Return
+            # the configured finite floor instead (default -50.0, far below any
+            # real log return).  This changes no trading semantics - only the
+            # scalar that enters the optimizer.
+            self._collapse_count += 1
+            return float(self.config.min_reward)
         return float((curr / prev).ln())
