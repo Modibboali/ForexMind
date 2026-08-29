@@ -1,0 +1,10 @@
+{
+  "status": "interrupted",
+  "algorithm": "ppo",
+  "env_steps": 36864,
+  "gradient_updates": 9,
+  "episodes": 72,
+  "best_checkpoint": null,
+  "best_validation_score": -Infinity,
+  "warnings": []
+}
