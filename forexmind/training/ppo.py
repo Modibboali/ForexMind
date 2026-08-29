@@ -18,9 +18,11 @@ Numerical stability (see docs/ppo_numerical_stability_audit.md):
   inputs;
 * actor and critic gradients are clipped to ``max_grad_norm`` (0 disables);
 * ``actor_lr`` / ``critic_lr`` are independently configurable;
-* the stored worker log-prob and the trainer's new log-prob both use the raw
-  Gaussian density on the clamped action (no inconsistent tanh correction).
-"""
+* the stored worker log-prob and the trainer's new log-prob both use the
+  density of the RAW pre-clamp Gaussian sample ``u`` (the exact sampling
+  distribution), while the environment-facing action stays ``clamp(u)``;
+* ``ppo_target_kl`` stops the remaining PPO epochs for a rollout once the
+  KL estimate exceeds it (policy cannot run away inside a rollout)."""
 
 from __future__ import annotations
 
@@ -86,6 +88,7 @@ class PPOTrainer(BaseTrainer):
         self._adv_epsilon = float(config.training.adv_epsilon)
         self._finite_alert_count = 0
         self._nonfinite_total = 0
+        self._clip_warn_count = 0
 
     # -- BaseTrainer interface ------------------------------------------------
 
@@ -161,6 +164,56 @@ class PPOTrainer(BaseTrainer):
             if self._check_first_nonfinite(f"{label}.{pname}.param", p, dim=None):
                 break
 
+    def _all_params(self) -> list[nn.Parameter]:
+        return [p for p in self.actor.parameters()] + [
+            p for p in self._value_net.parameters()
+        ]
+
+    def _param_update_magnitude(
+        self, params_before: list[torch.Tensor]
+    ) -> tuple[float, float]:
+        """Mean/max absolute parameter change over this rollout update."""
+        deltas = [
+            p.detach().sub(pb) for p, pb in zip(self._all_params(), params_before, strict=True)
+        ]
+        flat = torch.cat([d.ravel() for d in deltas])
+        if flat.numel() == 0:
+            return 0.0, 0.0
+        return float(flat.abs().mean().item()), float(flat.abs().max().item())
+
+    def _minibatch_actor(
+        self,
+        dist: Any,
+        act_raw: torch.Tensor,
+        old_logp: torch.Tensor,
+        adv: torch.Tensor,
+        *,
+        eps: float,
+        ent_coef: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float, float, torch.Tensor]:
+        """Clipped PPO actor surrogate for one minibatch.
+
+        ``act_raw`` is the pre-clamp Gaussian sample, so ``logp = log pi_theta
+        (u)`` is the density of the actual sampling distribution (not the
+        clamped boundary).  Returns ``(actor_loss, ratio, approx_kl,
+        approx_kl_log, clip_fraction, entropy)`` where
+
+        * ``approx_kl    = E[0.5 (r - 1)^2]``      (kept for continuity)
+        * ``approx_kl_log = E[r - 1 - log r]``      (standard KL estimate,
+           used for target-KL early stopping)
+        """
+        logp = dist.log_prob(act_raw).sum(-1, keepdim=True)
+        log_ratio = (logp - old_logp).clamp(-LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
+        ratio = log_ratio.exp()
+        approx_kl = float((0.5 * (ratio - 1.0).pow(2)).mean().item())
+        approx_kl_log = float(((ratio - 1.0) - log_ratio).mean().item())
+        clip_frac = float(((ratio - 1.0).abs() > eps).float().mean().item())
+        entropy = dist.entropy().sum(-1, keepdim=True).mean()
+        surr1 = ratio * adv
+        surr2 = ratio.clamp(1.0 - eps, 1.0 + eps) * adv
+        actor_loss = -(torch.min(surr1, surr2).mean() + ent_coef * entropy)
+        return actor_loss, ratio, approx_kl, approx_kl_log, clip_frac, entropy
+
     # -- GAE ------------------------------------------------------------------
 
     def _compute_gae(
@@ -218,6 +271,7 @@ class PPOTrainer(BaseTrainer):
         obs = np.stack([t.obs for t in rollout]).astype(np.float32)
         next_obs = np.stack([t.next_obs for t in rollout]).astype(np.float32)
         act = np.asarray([t.action for t in rollout], dtype=np.float32).reshape(-1, 1)
+        act_raw = np.asarray([t.action_raw for t in rollout], dtype=np.float32).reshape(-1, 1)
         rew = np.asarray([t.reward for t in rollout], dtype=np.float32)
         done = np.asarray([t.terminated for t in rollout], dtype=bool)
         old_logp = np.asarray([t.log_prob for t in rollout], dtype=np.float32).reshape(-1, 1)
@@ -228,6 +282,7 @@ class PPOTrainer(BaseTrainer):
         self._check_first_nonfinite("observation", obs, dim=obs.shape[1])
         self._check_first_nonfinite("next_observation", next_obs, dim=next_obs.shape[1])
         self._check_first_nonfinite("action", act, dim=1)
+        self._check_first_nonfinite("raw_action", act_raw, dim=1)
         self._check_first_nonfinite("reward", rew, dim=None)
         self._check_first_nonfinite("value_prediction", val, dim=None)
         self._check_first_nonfinite("next_value_prediction", next_val, dim=None)
@@ -242,7 +297,7 @@ class PPOTrainer(BaseTrainer):
 
         # -- stage 2: tensors -------------------------------------------------
         obs_t = torch.as_tensor(obs, device=self.device)
-        act_t = torch.as_tensor(act, device=self.device)
+        act_raw_t = torch.as_tensor(act_raw, device=self.device)
         old_logp_t = torch.as_tensor(old_logp, device=self.device)
         adv_t = torch.as_tensor(adv, device=self.device).unsqueeze(1)
         ret_t = torch.as_tensor(returns, device=self.device).unsqueeze(1)
@@ -253,18 +308,27 @@ class PPOTrainer(BaseTrainer):
         val_coef = cfg.ppo_value_coef
         batch = cfg.batch_size
         max_grad_norm = float(cfg.max_grad_norm)
+        target_kl = float(cfg.ppo_target_kl or 0.0)
+
+        params_before = [p.detach().clone() for p in self._all_params()]
 
         total_actor = 0.0
         total_value = 0.0
         total_entropy = 0.0
         total_kl = 0.0
+        total_kl_log = 0.0
         total_clip = 0.0
         actor_grad_norm = 0.0
         critic_grad_norm = 0.0
         actor_param_max = 0.0
         critic_param_max = 0.0
         n_batches = 0
-        for _ in range(cfg.ppo_epochs):
+        early_stop_kl = False
+        kl_stop_epoch = 0
+        high_clip = False
+        for epoch in range(cfg.ppo_epochs):
+            epoch_kl_log = 0.0
+            epoch_batches = 0
             perm = self._rng.permutation(n)
             for start in range(0, n, batch):
                 idx = perm[start : start + batch]
@@ -278,21 +342,18 @@ class PPOTrainer(BaseTrainer):
                 if torch.any(dist.scale <= 0):
                     self._check_first_nonfinite("actor_std_nonpositive", dist.scale, dim=None)
 
-                logp = dist.log_prob(act_t[idx]).sum(-1, keepdim=True)
-                self._check_first_nonfinite("log_prob", logp, dim=None)
+                actor_loss, _ratio, approx_kl, approx_kl_log, clip_frac, entropy = (
+                    self._minibatch_actor(
+                        dist,
+                        act_raw_t[idx],
+                        old_logp_t[idx],
+                        adv_t[idx],
+                        eps=eps,
+                        ent_coef=ent_coef,
+                    )
+                )
 
-                # -- ratio stability -------------------------------------------
-                log_ratio = (logp - old_logp_t[idx]).clamp(-LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
-                ratio = log_ratio.exp()
-                self._check_first_nonfinite("ratio", ratio, dim=None)
-                clip_frac = float(((ratio - 1.0).abs() > eps).float().mean().item())
-                approx_kl = float((0.5 * (ratio - 1.0).pow(2)).mean().item())
-                entropy = dist.entropy().sum(-1, keepdim=True).mean()
-
-                # -- losses -----------------------------------------------------
-                surr1 = ratio * adv_t[idx]
-                surr2 = ratio.clamp(1.0 - eps, 1.0 + eps) * adv_t[idx]
-                actor_loss = -(torch.min(surr1, surr2).mean() + ent_coef * entropy)
+                # -- value loss -------------------------------------------------
                 value_pred = self._value_net(obs_t[idx])
                 value_loss = F.mse_loss(value_pred, ret_t[idx])
                 loss = actor_loss + val_coef * value_loss
@@ -330,8 +391,35 @@ class PPOTrainer(BaseTrainer):
                 total_value += float(value_loss.item())
                 total_entropy += float(entropy.item())
                 total_kl += approx_kl
+                total_kl_log += approx_kl_log
                 total_clip += clip_frac
+                epoch_kl_log += approx_kl_log
+                epoch_batches += 1
                 n_batches += 1
+                if clip_frac > 0.95:
+                    high_clip = True
+
+            # -- target-KL early stopping for this rollout ---------------------
+            if target_kl > 0 and epoch_batches and (epoch_kl_log / epoch_batches) > target_kl:
+                early_stop_kl = True
+                kl_stop_epoch = epoch + 1
+                break
+
+        mean_abs_param_update, max_abs_param_update = self._param_update_magnitude(
+            params_before
+        )
+
+        if high_clip:
+            self._clip_warn_count += 1
+            if (
+                self._clip_warn_count in (1, 5, 10, 20, 50)
+                or self._clip_warn_count % 100 == 0
+            ):
+                print(
+                    "[ppo] WARNING clip_fraction>0.95 in a minibatch "
+                    f"(env_steps={self._env_steps:,}, count={self._clip_warn_count})",
+                    flush=True,
+                )
 
         # -- stage 3: action-distribution stats for the trading policy ---------
         a = act.ravel()
@@ -347,11 +435,17 @@ class PPOTrainer(BaseTrainer):
             "critic_loss": total_value / max(1, n_batches),
             "entropy": total_entropy / max(1, n_batches),
             "approx_kl": total_kl / max(1, n_batches),
+            "approx_kl_log": total_kl_log / max(1, n_batches),
             "clip_fraction": total_clip / max(1, n_batches),
+            "early_stop_kl": 1.0 if early_stop_kl else 0.0,
+            "kl_stop_epoch": float(kl_stop_epoch),
+            "high_clip_fraction": 1.0 if high_clip else 0.0,
             "actor_grad_norm": actor_grad_norm,
             "critic_grad_norm": critic_grad_norm,
             "actor_param_max": actor_param_max,
             "critic_param_max": critic_param_max,
+            "mean_abs_parameter_update": mean_abs_param_update,
+            "max_abs_parameter_update": max_abs_param_update,
             "reward_min": rew_stats.get("min") or 0.0,
             "reward_max": rew_stats.get("max") or 0.0,
             "reward_mean": rew_stats.get("mean") or 0.0,

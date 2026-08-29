@@ -51,6 +51,11 @@ class Transition:
     # Diagnostic-only provenance for the first-non-finite audit.
     instrument: str = ""
     timestamp: object | None = None
+    # For PPO: the raw pre-clamp Gaussian sample ``u ~ N(mean, std)``.  The
+    # importance ratio must use the density at THIS value (the actual sample
+    # of the policy's Gaussian); ``action`` remains the env-facing clamped
+    # projection.  ``action_raw == action`` when the sample was not clamped.
+    action_raw: float = 0.0
 
 
 def worker_episode_seed(global_seed: int, worker_id: int, episode_index: int) -> int:
@@ -159,6 +164,7 @@ class EnvWorker:
         log_prob = 0.0
         value = 0.0
         action_f = 0.0
+        action_raw_f = 0.0
         if use_policy and policy is not None:
             # Isolate this worker's policy sampling RNG so the learner's RNG is
             # untouched and the worker is deterministic in the sync backend.
@@ -172,18 +178,19 @@ class EnvWorker:
 
                     gauss = cast(GaussianPolicy, policy)
                     dist = gauss(obs_t)
-                    raw = dist.sample()
-                    action = torch.clamp(raw, -1.0, 1.0)
-                    # Consistent with the trainer's ``update``: the stored
-                    # log-prob is the raw Gaussian density evaluated at the
-                    # (clamped) action.  The action is CLAMPED, not
-                    # tanh-squashed, so the tanh Jacobian correction must NOT
-                    # be applied here (it was - a mismatch that made
-                    # ``ratio = exp(new_logp - old_logp)`` systematically
-                    # wrong and could drive ratios toward overflow).
-                    log_prob = float(dist.log_prob(action).sum().item())
+                    raw = dist.sample()  # u ~ N(mean, std)
+                    action_env = torch.clamp(raw, -1.0, 1.0)  # projection for the env
+                    # The stored log-prob must be the density of the ACTUAL
+                    # sample ``u`` (the policy is a plain Gaussian over u; the
+                    # clamp is only an execution-time projection).  Evaluating
+                    # N() at the clamped boundary instead makes old/new
+                    # log-probs not correspond to the sampling distribution
+                    # and can drive the PPO ratio to diverge.  The env action
+                    # stays clamped - the trading semantics are unchanged.
+                    log_prob = float(dist.log_prob(raw).sum().item())
                     value = float(value_net(obs_t).item()) if value_net is not None else 0.0
-                    action_f = float(action.item())
+                    action_f = float(action_env.item())
+                    action_raw_f = float(raw.item())
                 else:
                     action_f = float(sample_action(policy, last_obs, self.algorithm))
         else:
@@ -211,6 +218,7 @@ class EnvWorker:
             worker_pid=os.getpid(),
             instrument=str(obs.instrument) if obs.instrument else "",
             timestamp=obs.timestamp,
+            action_raw=action_raw_f,
         )
         self._active = (env, builder, _spec, next_obs)
         self._total_steps += 1

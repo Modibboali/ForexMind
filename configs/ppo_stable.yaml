@@ -11,7 +11,10 @@
 #   actor_lr / critic_lr: independent, conservative 3e-4.
 #   max_grad_norm: 0.5 gradient clipping for actor and critic (was none).
 #   log_std bounds [-5, 2]: keeps exp(log_std) finite (std in [0.007, 7.4]).
-#   ppo_epochs: 5 (was 10) - less policy drift per rollout (lower KL).
+#   ppo_epochs: 3 (was 5/10) - less policy drift per rollout (lower KL).
+#   ppo_target_kl: 0.02 - stop the remaining PPO epochs for a rollout once the
+#                 KL estimate exceeds it, so the policy cannot run away inside
+#                 a single rollout (divergence brake).
 #   finite_check: true - raises FiniteError at the FIRST non-finite value so
 #                 this validation run proves no NaN/Inf/explosion.
 #   torch_interop_threads: 2 (was torch default ~112 on Kaggle) - resource
@@ -44,8 +47,9 @@ training:
   log_std_max: 2.0
   adv_epsilon: 1.0e-8
   finite_check: true
+  ppo_target_kl: 0.02
   alpha: auto
-  ppo_epochs: 5
+  ppo_epochs: 3
   ppo_clip_epsilon: 0.2
   ppo_entropy_coef: 0.01
   ppo_value_coef: 0.5

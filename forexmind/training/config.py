@@ -58,6 +58,7 @@ class TrainingConfig:
     log_std_max: float = 2.0
     adv_epsilon: float = 1e-8  # advantage-normalization denominator floor
     finite_check: bool = False  # raise FiniteError at the first non-finite value
+    ppo_target_kl: float = 0.02  # stop PPO epochs for a rollout when KL exceeds (0 disables)
     # Worker policy sync
     policy_sync_interval: int = 10_000  # env steps between worker policy updates
 
