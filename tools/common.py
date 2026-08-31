@@ -82,6 +82,9 @@ def environment_config_from_dict(d: dict[str, Any]) -> EnvironmentConfig:
             slippage_mode=str(ex["slippage_mode"]),
             slippage_value=float(ex["slippage_value"]),
             commission_per_unit=float(ex["commission_per_unit"]),
+            instrument_spreads={
+                k: float(v) for k, v in (ex.get("instrument_spreads") or {}).items()
+            },
         ),
         margin=MarginConfig(
             initial_balance=Decimal(str(mg["initial_balance"])),
@@ -95,6 +98,7 @@ def environment_config_from_dict(d: dict[str, Any]) -> EnvironmentConfig:
         sizing=PositionSizingConfig(
             mode=str(sz["mode"]), fixed_units=Decimal(str(sz["fixed_units"]))
         ),
+        account_currency=str(d.get("account_currency", "USD")),
         decision_interval_minutes=int(d["decision_interval_minutes"]),
         execution_timing=str(d["execution_timing"]),
         mtm_price=str(d["mtm_price"]),

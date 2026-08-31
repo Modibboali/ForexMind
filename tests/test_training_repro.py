@@ -64,10 +64,12 @@ def test_episode_specs_deterministic() -> None:
     from forexmind.training.benchmark import build_test_episode_specs
 
     ds = _volatile_dataset()
-    a = build_test_episode_specs(ds, split="train", n_episodes=5, horizon=16,
-                                 context_length=8, seed=7)
-    b = build_test_episode_specs(ds, split="train", n_episodes=5, horizon=16,
-                                 context_length=8, seed=7)
+    a = build_test_episode_specs(
+        ds, split="train", n_episodes=5, horizon=16, context_length=8, seed=7
+    )
+    b = build_test_episode_specs(
+        ds, split="train", n_episodes=5, horizon=16, context_length=8, seed=7
+    )
     for x, y in zip(a, b, strict=True):
         assert x.instrument == y.instrument
         assert x.start_index == y.start_index
@@ -109,8 +111,6 @@ def test_interrupted_run_leaves_rescue_checkpoint(tmp_path) -> None:
     assert (tmp_path / "e" / "training_summary.json").is_file()
     import json as _json
 
-    summary = _json.loads(
-        (tmp_path / "e" / "training_summary.json").read_text(encoding="utf-8")
-    )
+    summary = _json.loads((tmp_path / "e" / "training_summary.json").read_text(encoding="utf-8"))
     assert summary["status"] == "interrupted"
     assert summary["env_steps"] == 128

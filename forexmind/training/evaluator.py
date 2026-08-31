@@ -27,9 +27,20 @@ from forexmind.training.policies import PolicyAgent
 
 
 def _f(value: object, default: float = 0.0) -> float:
-    """Coerce an unknown value to float."""
+    """Coerce an unknown value to float.
+
+    Execution prices and PnL are stored in the trade log as strings (Decimal
+    serialization, e.g. ``'1.20088'``), so numeric strings must be coerced too;
+    otherwise notional/turnover silently becomes 0.  Non-numeric values fall
+    back to ``default``.
+    """
     if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
     return default
 
 
@@ -84,14 +95,14 @@ class PolicyEvaluator:
         self.lambda_drawdown = lambda_drawdown
         self.eval_horizon = eval_horizon
         self.eval_seed = eval_seed
-        self._runner = EvaluationRunner(
-            dataset, env_config, self.encoder, self.window_config
-        )
+        self._runner = EvaluationRunner(dataset, env_config, self.encoder, self.window_config)
 
     def _episode_specs(self, split: str, n_episodes: int, seed: int) -> list[EpisodeSpec]:
         cfg = EpisodeConfig(
-            split=split, horizon=self.eval_horizon,
-            context_length=self.window_config.context_length, seed=seed,
+            split=split,
+            horizon=self.eval_horizon,
+            context_length=self.window_config.context_length,
+            seed=seed,
         )
         return EpisodeSampler(self.dataset, cfg).sample(n_episodes, seed=seed)
 
@@ -147,9 +158,14 @@ def _pooled_turnover(ev: AgentEvaluation) -> float:
         for t in trajs:
             capital += _f(t.info.get("initial_balance"))
             for trade in t.trade_log:
-                units = trade.get("units_delta", 0.0)
-                price = trade.get("execution_price") or 0.0
-                total_notional += abs(_f(units)) * _f(price)
+                # Prefer account-currency notional (Phase 3.1); fall back to
+                # quote-currency notional for older logs (USD-quote pairs only).
+                if "notional_account" in trade:
+                    total_notional += abs(_f(trade.get("notional_account")))
+                else:
+                    units = trade.get("units_delta", 0.0)
+                    price = trade.get("execution_price") or 0.0
+                    total_notional += abs(_f(units)) * _f(price)
     return total_notional / capital if capital > 0 else 0.0
 
 

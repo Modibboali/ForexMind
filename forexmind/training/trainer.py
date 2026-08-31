@@ -59,6 +59,8 @@ def build_env_config(env_cfg: TrainingEnvConfig) -> EnvironmentConfig:
         sizing_mode=env_cfg.sizing_mode,
         min_reward=env_cfg.min_reward,
         max_reward=env_cfg.max_reward,
+        account_currency=env_cfg.account_currency,
+        instrument_spreads=dict(env_cfg.instrument_spreads),
     )
 
 

@@ -47,6 +47,7 @@ def env_config_to_dict(config: EnvironmentConfig) -> dict[str, object]:
             "slippage_mode": config.execution.slippage_mode,
             "slippage_value": config.execution.slippage_value,
             "commission_per_unit": config.execution.commission_per_unit,
+            "instrument_spreads": dict(config.execution.instrument_spreads),
         },
         "margin": {
             "initial_balance": str(config.margin.initial_balance),
@@ -66,6 +67,7 @@ def env_config_to_dict(config: EnvironmentConfig) -> dict[str, object]:
             "mode": config.sizing.mode,
             "fixed_units": str(config.sizing.fixed_units),
         },
+        "account_currency": config.account_currency,
         "decision_interval_minutes": config.decision_interval_minutes,
         "execution_timing": config.execution_timing,
         "mtm_price": config.mtm_price,

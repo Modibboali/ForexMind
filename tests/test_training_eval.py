@@ -22,12 +22,15 @@ def _ds():
     from tests.synthetic import make_instrument, make_split_dataset, timeline_m5
 
     dates = [
-        "2020-01-06", "2020-06-01", "2020-12-07",
-        "2021-03-01", "2021-09-01", "2022-03-01", "2022-09-01",
+        "2020-01-06",
+        "2020-06-01",
+        "2020-12-07",
+        "2021-03-01",
+        "2021-09-01",
+        "2022-03-01",
+        "2022-09-01",
     ]
-    return make_split_dataset(
-        {"EURUSD": make_instrument("EURUSD", timeline_m5(dates, per_day=40))}
-    )
+    return make_split_dataset({"EURUSD": make_instrument("EURUSD", timeline_m5(dates, per_day=40))})
 
 
 def _env_encoder():
@@ -36,7 +39,9 @@ def _env_encoder():
     from forexmind.observation.window import WindowConfig
 
     env_config = default_config(
-        initial_balance="10000", leverage=50, spread_value=0.0002,
+        initial_balance="10000",
+        leverage=50,
+        spread_value=0.0002,
         sizing_mode="equity_fraction",
     )
     encoder = ObservationEncoder(EncoderConfig(context_length=8, initial_balance="10000"))
@@ -91,13 +96,25 @@ def test_policy_evaluator_returns_metrics() -> None:
     ds = _ds()
     env_config, encoder, window_config = _env_encoder()
     evaluator = PolicyEvaluator(
-        ds, env_config, encoder, window_config, eval_horizon=16, eval_seed=42,
+        ds,
+        env_config,
+        encoder,
+        window_config,
+        eval_horizon=16,
+        eval_seed=42,
         context_length=8,
     )
     result = evaluator.evaluate(_policy(), "sac", "validation", 2, seed=42)
     assert result.split == "validation"
-    for key in ("total_return", "sharpe", "sortino", "max_drawdown_pct",
-                "_selection_score", "turnover", "mean_reward"):
+    for key in (
+        "total_return",
+        "sharpe",
+        "sortino",
+        "max_drawdown_pct",
+        "_selection_score",
+        "turnover",
+        "mean_reward",
+    ):
         assert key in result.metrics
     assert np.isfinite(result.score)
 
@@ -106,7 +123,12 @@ def test_policy_evaluator_deterministic_across_runs() -> None:
     ds = _ds()
     env_config, encoder, window_config = _env_encoder()
     evaluator = PolicyEvaluator(
-        ds, env_config, encoder, window_config, eval_horizon=16, eval_seed=42,
+        ds,
+        env_config,
+        encoder,
+        window_config,
+        eval_horizon=16,
+        eval_seed=42,
         context_length=8,
     )
     policy = _policy()
@@ -151,9 +173,16 @@ def test_write_benchmark_results_files(tmp_path) -> None:
     ds = _ds()
     env_config, encoder, window_config = _env_encoder()
     bench = benchmark_test_split(
-        dataset=ds, env_config=env_config, encoder=encoder,
-        window_config=window_config, policy=_policy(), algorithm="sac",
-        split="test", n_episodes=2, horizon=16, seed=42,
+        dataset=ds,
+        env_config=env_config,
+        encoder=encoder,
+        window_config=window_config,
+        policy=_policy(),
+        algorithm="sac",
+        split="test",
+        n_episodes=2,
+        horizon=16,
+        seed=42,
     )
     paths = write_benchmark_results(bench, tmp_path)
     assert paths["json"].is_file()
@@ -205,6 +234,42 @@ def test_load_checkpoint_policy_roundtrip_ppo(tmp_path) -> None:
     assert -1.0 <= action <= 1.0
     for p1, p2 in zip(trainer.actor.parameters(), policy.parameters(), strict=True):
         assert np.allclose(p1.detach().numpy(), p2.detach().numpy())
+
+
+# ---------------------------------------------------------------------------
+# Turnover metric (execution_price is a str in the trade log)
+# ---------------------------------------------------------------------------
+
+
+def test_pooled_turnover_coerces_string_price() -> None:
+    """execution_price is stored as a str; turnover must still be computed."""
+    from forexmind.training.evaluator import _f, _pooled_turnover
+
+    assert _f("1.20088") == pytest.approx(1.20088)
+    assert _f("not-a-number", default=0.0) == 0.0
+    assert _f(1.25) == pytest.approx(1.25)
+
+    class _Traj:
+        def __init__(self, trade_log):
+            self.info = {"initial_balance": 10000.0}
+            self.trade_log = trade_log
+
+    class _Ev:
+        def __init__(self, trajs):
+            self.trajectories_by_instrument = {"EURUSD": trajs}
+
+    ev = _Ev(
+        [
+            _Traj(
+                [
+                    {"units_delta": -1725.7325883395993, "execution_price": "1.20088"},
+                    {"units_delta": 6603.40551283013, "execution_price": "1.20055"},
+                ]
+            )
+        ]
+    )
+    turnover = _pooled_turnover(ev)
+    assert turnover > 0.0  # was 0.0 before the _f string-coercion fix
 
 
 # ---------------------------------------------------------------------------

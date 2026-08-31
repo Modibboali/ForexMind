@@ -49,7 +49,14 @@ class ExecutionConfig:
     ``buy += slippage``, ``sell -= slippage``.
 
     ``commission_per_unit``: quote-currency cost per base unit traded, charged
-    on every execution side (open and close).
+    on every execution side (open and close).  The resulting commission is
+    converted into the account currency before it affects balance/equity.
+
+    ``instrument_spreads`` (optional) overrides the global ``spread_value`` on
+    a per-instrument basis.  Keys are instrument names (upper-case); values are
+    absolute spread amounts in price units.  This lets us use the correct pip
+    convention per instrument (e.g. **0.01** for JPY pairs vs **0.0001** for
+    non-JPY pairs) instead of one raw ``0.0002`` across every pair.
     """
 
     spread_mode: str = "fixed"
@@ -57,6 +64,7 @@ class ExecutionConfig:
     slippage_mode: str = "none"
     slippage_value: float = 0.0
     commission_per_unit: float = 0.0
+    instrument_spreads: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.spread_mode != "fixed":
@@ -73,6 +81,9 @@ class ExecutionConfig:
             raise ValueError("slippage_value must be >= 0")
         if self.commission_per_unit < 0:
             raise ValueError("commission_per_unit must be >= 0")
+        for key, value in self.instrument_spreads.items():
+            if value < 0:
+                raise ValueError(f"instrument_spreads[{key}] must be >= 0")
 
     @classmethod
     def from_pips(
@@ -81,6 +92,7 @@ class ExecutionConfig:
         spread_pips: float = 0.0,
         slippage_pips: float = 0.0,
         commission_per_unit: float = 0.0,
+        instrument_spreads: dict[str, float] | None = None,
     ) -> ExecutionConfig:
         """Build a config with spread/slippage expressed in pips."""
         return cls(
@@ -89,6 +101,7 @@ class ExecutionConfig:
             slippage_mode="fixed" if slippage_pips else "none",
             slippage_value=slippage_pips * pip_size,
             commission_per_unit=commission_per_unit,
+            instrument_spreads=dict(instrument_spreads or {}),
         )
 
     @property
@@ -102,6 +115,17 @@ class ExecutionConfig:
     @property
     def commission_decimal(self) -> Decimal:
         return _dec(self.commission_per_unit)
+
+    def spread_for(self, instrument: str) -> Decimal:
+        """Absolute spread (price units) for ``instrument``.
+
+        Uses the per-instrument override when configured, else the global
+        ``spread_value``.
+        """
+        spec = self.instrument_spreads.get(instrument.upper())
+        if spec is not None:
+            return _dec(spec)
+        return self.spread_decimal
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +239,13 @@ class EnvironmentConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     sizing: PositionSizingConfig = field(default_factory=PositionSizingConfig)
 
+    # Explicit account currency.  All account-level monetary quantities
+    # (balance, equity, realized/unrealized PnL, margin, gross exposure) are
+    # expressed in this currency.  Default is USD; the architecture supports
+    # EUR/GBP/JPY/CHF/CAD/AUD/NZD account currencies without rewriting the
+    # portfolio engine (conversion is delegated to the FX service).
+    account_currency: str = "USD"
+
     decision_interval_minutes: int = 5
     # Fixed Phase-1 execution convention: the next M1 bar's open after the
     # observed M5 close (see README, "No-lookahead policy").
@@ -238,6 +269,8 @@ class EnvironmentConfig:
             raise ValueError("horizon must be > 0 or None")
         if self.observation_window <= 0:
             raise ValueError("observation_window must be > 0")
+        if not self.account_currency:
+            raise ValueError("account_currency must be a non-empty currency code")
 
 
 def default_config(
@@ -251,6 +284,8 @@ def default_config(
     fixed_units: float | str | Decimal = "100000",
     min_reward: float = -50.0,
     max_reward: float | None = None,
+    account_currency: str = "USD",
+    instrument_spreads: dict[str, float] | None = None,
 ) -> EnvironmentConfig:
     """Convenience factory for a sensible default Phase-1 configuration."""
     return EnvironmentConfig(
@@ -260,8 +295,10 @@ def default_config(
             slippage_mode="fixed" if slippage_value else "none",
             slippage_value=slippage_value,
             commission_per_unit=commission_per_unit,
+            instrument_spreads=dict(instrument_spreads or {}),
         ),
         margin=MarginConfig(initial_balance=_dec(initial_balance), leverage=_dec(leverage)),
         sizing=PositionSizingConfig(mode=sizing_mode, fixed_units=_dec(fixed_units)),
         reward=RewardConfig(min_reward=min_reward, max_reward=max_reward),
+        account_currency=account_currency,
     )

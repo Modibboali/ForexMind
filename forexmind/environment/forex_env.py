@@ -27,6 +27,8 @@ from forexmind.data.schema import CLOSE, HIGH, LOW, OPEN, TIMESTAMP, MarketBar
 from forexmind.environment.actions import Action, resolve_action
 from forexmind.environment.costs import ExecutionCostModel
 from forexmind.environment.execution import ExecutionEngine, ExecutionReport
+from forexmind.environment.financing import FinancingModel, ZeroCostFinancing
+from forexmind.environment.fx_conversion import CurrencyConverter
 from forexmind.environment.margin import MarginModel
 from forexmind.environment.portfolio import Portfolio, TradeResult
 from forexmind.environment.reward import RewardService
@@ -74,6 +76,8 @@ class ForexEnvironment:
         self._engine = ExecutionEngine(self._cost_model)
         self._margin = MarginModel(config.margin)
         self._reward = RewardService(config.reward)
+        self._converter = CurrencyConverter(config.account_currency)
+        self._financing: FinancingModel = ZeroCostFinancing()
 
         # Episode state (re-initialised by reset()).
         self._instrument: str | None = None
@@ -145,7 +149,12 @@ class ForexEnvironment:
         self._start_index = start_index
 
         # Fresh account.
-        self._portfolio = Portfolio(instr, self.config.margin.initial_balance)
+        self._portfolio = Portfolio(
+            instr,
+            self.config.margin.initial_balance,
+            account_currency=self.config.account_currency,
+            converter=self._converter,
+        )
         self._mark_at_observation(self._obs_idx)
         self._prev_equity = self._portfolio.equity
 
@@ -203,7 +212,7 @@ class ForexEnvironment:
         target_units = self._target_units(act, exec_mid)
         delta = target_units - current_units
 
-        report = self._engine.execute(exec_ts, exec_mid, delta)
+        report = self._engine.execute(exec_ts, exec_mid, delta, instrument=self._instrument)
         trade = self._portfolio.adjust_to_target(
             target_units, report.execution_price, report.commission
         )
@@ -211,14 +220,15 @@ class ForexEnvironment:
         # Mark to market at the next observation's close.
         next_idx = i + 1
         self._mark_at_observation(next_idx)
+        # Apply overnight financing (zero-cost in Phase 3.1) after marking.
+        self._apply_financing(exec_ts, next_idx)
 
         terminated = False
         liquidation = False
-        # Deterministic liquidation check.
+        # Deterministic liquidation check (all amounts in account currency).
         snap = self._margin.snapshot(
             equity=self._portfolio.equity,
-            units=self._portfolio.position.units,
-            price=self._portfolio.current_mid or exec_mid,
+            gross_exposure=self._portfolio.snapshot().gross_exposure,
         )
         if snap.liquidation:
             liquidation = True
@@ -349,16 +359,31 @@ class ForexEnvironment:
         exposure = _dec(action.target_exposure)
         if sizing.mode == "fixed_units":
             return exposure * sizing.fixed_units
-        # equity_fraction: exposure * current equity / execution mid price
+        # equity_fraction (Phase 3.1, account-currency aware):
+        #   target_gross_exposure_account = |exposure| * equity
+        #   units = target_gross_exposure_account / (price * quote_to_account_factor)
+        #
+        # For a USD-quote pair (EURUSD etc.) the quote->account factor is 1, so
+        #   units = exposure * equity / price.
+        # For a USD/XXX pair (USDJPY etc.) one base unit of USD == one USD of
+        # notional, so units ~= exposure * equity (independent of the JPY price
+        # scale).  The general formula below yields exactly this.
         equity = self._portfolio.equity
-        return exposure * equity / exec_mid
+        target_exposure_acct = exposure * equity
+        factor = self._portfolio.converter.quote_to_account_factor(
+            self._instrument or "", exec_mid, self.config.account_currency
+        )
+        denom = exec_mid * factor
+        if denom == 0:
+            return Decimal(0)
+        return target_exposure_acct / denom
 
     def _mark_at_observation(self, obs_idx: int) -> None:
         assert self._portfolio is not None and self._m5 is not None
         row = self._m5.iloc[obs_idx]
         mid = _dec(float(row[CLOSE]))
         if self.config.mtm_price == "bid_ask":
-            prices = self._cost_model.execution_prices(mid)
+            prices = self._cost_model.execution_prices(mid, instrument=self._instrument)
             if self._portfolio.position.units > 0:
                 self._portfolio.mark_to_market(prices.sell)
             else:
@@ -372,7 +397,7 @@ class ForexEnvironment:
         mid = self._portfolio.current_mid
         if mid is None or self._portfolio.position.is_flat:
             return
-        prices = self._cost_model.execution_prices(mid)
+        prices = self._cost_model.execution_prices(mid, instrument=self._instrument)
         close_price = prices.sell if self._portfolio.position.units > 0 else prices.buy
         commission = self._cost_model.commission(self._portfolio.position.units)
         self._portfolio.close_all(close_price, commission)
@@ -383,11 +408,39 @@ class ForexEnvironment:
         mid = self._portfolio.current_mid
         if mid is None:
             return
-        prices = self._cost_model.execution_prices(mid)
+        prices = self._cost_model.execution_prices(mid, instrument=self._instrument)
         close_price = prices.sell if self._portfolio.position.units > 0 else prices.buy
         commission = self._cost_model.commission(self._portfolio.position.units)
         self._portfolio.close_all(close_price, commission)
         self._portfolio.mark_to_market(mid)
+
+    def set_financing(self, model: FinancingModel) -> None:
+        """Install a financing model (default :class:`ZeroCostFinancing`)."""
+        self._financing = model
+
+    def _apply_financing(self, exec_ts: pd.Timestamp, mark_obs_idx: int) -> None:
+        """Charge overnight financing cost (account currency) on the open position.
+
+        Phase 3.1 uses the zero-cost default.  The interface is wired through
+        so real swap tables can be introduced later without redesign.
+        """
+        assert self._portfolio is not None and self._m5 is not None
+        units = self._portfolio.position.units
+        if units == 0:
+            return
+        mark_ts = pd.Timestamp(self._m5.iloc[mark_obs_idx][TIMESTAMP])
+        hold_seconds = float((mark_ts - exec_ts) / pd.Timedelta(seconds=1))
+        cost = self._financing.financing_cost(
+            instrument_spec=self._portfolio.instrument_spec,
+            units=units,
+            entry_price=self._portfolio.position.entry_price,
+            hold_seconds=hold_seconds,
+            now=mark_ts,
+            entry_time=exec_ts,
+        )
+        if cost:
+            # Financing reduces equity directly through the balance.
+            self._portfolio.apply_cash_adjustment(-cost)
 
     def _truncate_at(self, obs_idx: int) -> None:
         self._obs_idx = obs_idx
@@ -427,11 +480,9 @@ class ForexEnvironment:
         )
 
         snap = self._portfolio.snapshot()
-        mark_price = self._portfolio.current_mid or _dec(float(self._m5.iloc[obs_idx][CLOSE]))
         margin = self._margin.snapshot(
             equity=snap.equity,
-            units=snap.position.units,
-            price=mark_price,
+            gross_exposure=snap.gross_exposure,
         )
         account = AccountState(
             balance=snap.balance,
@@ -444,6 +495,10 @@ class ForexEnvironment:
             margin_used=margin.margin_used,
             free_margin=margin.free_margin,
             drawdown=snap.drawdown,
+            account_currency=self.config.account_currency,
+            base_currency=snap.base_currency,
+            quote_currency=snap.quote_currency,
+            raw_unrealized_pnl=self._portfolio.raw_unrealized_pnl,
         )
         time_info = TimeInfo(
             timestamp=ts,
@@ -477,16 +532,20 @@ class ForexEnvironment:
     ) -> dict[str, object]:
         assert self._portfolio is not None
         snap = self._portfolio.snapshot()
-        mark_price = self._portfolio.current_mid or _dec(float(obs.market_window[-1].close))
         margin = self._margin.snapshot(
             equity=snap.equity,
-            units=snap.position.units,
-            price=mark_price,
+            gross_exposure=snap.gross_exposure,
         )
         info: dict[str, object] = {
             "timestamp": obs.timestamp,
             "instrument": obs.instrument,
             "step_index": obs.step_index,
+            # Currency metadata (Phase 3.1)
+            "account_currency": self.config.account_currency,
+            "base_currency": snap.base_currency,
+            "quote_currency": snap.quote_currency,
+            "raw_unrealized_pnl": self._portfolio.raw_unrealized_pnl,
+            "conversion_rate": self._portfolio.conversion_rate,
             "equity": snap.equity,
             "balance": snap.balance,
             "position": snap.position.direction,
@@ -512,16 +571,29 @@ class ForexEnvironment:
         if trade is not None:
             if trade.executed_units:
                 spread_cost = abs(trade.executed_units) * abs(
-                    self._cost_model.execution_prices(trade.execution_price).mid
+                    self._cost_model.execution_prices(
+                        trade.execution_price, instrument=self._instrument
+                    ).mid
                     - trade.execution_price
                 )
             else:
                 spread_cost = Decimal(0)
-            info["trade_cost"] = trade.commission + spread_cost
+            # spread_cost is quote-currency; convert to account currency.
+            spread_cost_acct = spread_cost * self._portfolio.converter.quote_to_account_factor(
+                self._instrument or "",
+                trade.execution_price,
+                self.config.account_currency,
+            )
+            info["trade_cost"] = trade.commission + spread_cost_acct
             info["execution_price"] = trade.execution_price
             info["trade_direction"] = trade.direction
             info["units_delta"] = trade.units_delta
             info["trade_realized_pnl"] = trade.realized_pnl
+            info["raw_pnl"] = trade.raw_pnl
+            info["raw_pnl_currency"] = trade.raw_pnl_currency
+            info["converted_pnl"] = trade.converted_pnl
+            info["trade_conversion_rate"] = trade.conversion_rate
+            info["commission_raw"] = trade.commission_raw
         if execution is not None:
             info["execution_mid"] = execution.mid_price
             info["execution_price"] = execution.execution_price

@@ -31,9 +31,7 @@ def make_training_dataset(
     instruments: tuple[str, ...] = DEFAULT_INSTRUMENT_ORDER,
 ) -> SplitDataset:
     cfg = split_config or SplitConfig.default()
-    return SplitDataset(
-        cfg, lambda k: load_processed_from_dir(k, processed_dir), instruments
-    )
+    return SplitDataset(cfg, lambda k: load_processed_from_dir(k, processed_dir), instruments)
 
 
 def dataset_summary(dataset: SplitDataset) -> dict[str, object]:

@@ -28,9 +28,7 @@ class CheckpointManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(state, path)
         # Mark "latest" pointer.
-        (self.run_dir / "checkpoints" / "latest.txt").write_text(
-            f"{name}.pt\n", encoding="utf-8"
-        )
+        (self.run_dir / "checkpoints" / "latest.txt").write_text(f"{name}.pt\n", encoding="utf-8")
         return path
 
     def load(self, path: str | Path) -> dict[str, Any]:

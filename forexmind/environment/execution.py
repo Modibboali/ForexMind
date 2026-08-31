@@ -28,6 +28,7 @@ class ExecutionReport:
     commission: Decimal
     gross_flow: Decimal  # signed cash flow before commission
     net_flow: Decimal  # signed cash flow after commission
+    instrument: str | None = None  # instrument (for per-pair spread resolution)
 
 
 class ExecutionEngine:
@@ -41,14 +42,16 @@ class ExecutionEngine:
         timestamp: pd.Timestamp,
         mid_price: float | Decimal,
         units_delta: float | int | Decimal,
+        instrument: str | None = None,
     ) -> ExecutionReport:
         """Execute ``units_delta`` at the cost-adjusted price.
 
         ``units_delta > 0`` buys at the ask (mid + spread/2 + slippage);
         ``units_delta < 0`` sells at the bid (mid - spread/2 - slippage).
+        ``instrument`` selects the per-pair spread override when configured.
         """
         delta = _dec(units_delta)
-        prices = self.cost_model.execution_prices(mid_price)
+        prices = self.cost_model.execution_prices(mid_price, instrument)
         if delta == 0:
             return ExecutionReport(
                 timestamp=timestamp,
@@ -59,6 +62,7 @@ class ExecutionEngine:
                 commission=Decimal(0),
                 gross_flow=Decimal(0),
                 net_flow=Decimal(0),
+                instrument=instrument,
             )
         direction = "buy" if delta > 0 else "sell"
         price = prices.buy if delta > 0 else prices.sell
@@ -74,4 +78,5 @@ class ExecutionEngine:
             commission=commission,
             gross_flow=gross_flow,
             net_flow=net_flow,
+            instrument=instrument,
         )

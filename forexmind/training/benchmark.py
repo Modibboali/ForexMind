@@ -82,9 +82,7 @@ def build_test_episode_specs(
     seed: int = 42,
 ) -> list[EpisodeSpec]:
     """Deterministic episode specs shared by every agent in the benchmark."""
-    cfg = EpisodeConfig(
-        split=split, horizon=horizon, context_length=context_length, seed=seed
-    )
+    cfg = EpisodeConfig(split=split, horizon=horizon, context_length=context_length, seed=seed)
     return EpisodeSampler(dataset, cfg).sample(n_episodes, seed=seed)
 
 
@@ -137,6 +135,15 @@ def summarize_evaluation(
     }
 
 
+def _trade_notional(trade: Mapping[str, Any]) -> float:
+    """Account-currency notional of a trade, falling back to quote notional."""
+    if "notional_account" in trade:
+        return abs(_f(trade.get("notional_account")))
+    units = trade.get("units_delta", 0.0)
+    price = trade.get("execution_price") or 0.0
+    return abs(_f(units)) * _f(price)
+
+
 def _pooled_turnover(evaluation: AgentEvaluation) -> float:
     total_notional = 0.0
     capital = 0.0
@@ -144,9 +151,7 @@ def _pooled_turnover(evaluation: AgentEvaluation) -> float:
         for t in trajs:
             capital += _f(t.info.get("initial_balance"))
             for trade in t.trade_log:
-                units = trade.get("units_delta", 0.0)
-                price = trade.get("execution_price") or 0.0
-                total_notional += abs(_f(units)) * _f(price)
+                total_notional += _trade_notional(trade)
     return total_notional / capital if capital > 0 else 0.0
 
 
@@ -156,9 +161,7 @@ def _pooled_turnover_for(trajs: list[Any]) -> float:
     for t in trajs:
         capital += _f(t.info.get("initial_balance"))
         for trade in t.trade_log:
-            units = trade.get("units_delta", 0.0)
-            price = trade.get("execution_price") or 0.0
-            total_notional += abs(_f(units)) * _f(price)
+            total_notional += _trade_notional(trade)
     return total_notional / capital if capital > 0 else 0.0
 
 
@@ -173,7 +176,15 @@ def _pooled_mean_reward(evaluation: AgentEvaluation) -> float:
 
 
 def _f(value: Any, default: float = 0.0) -> float:
-    return float(value) if isinstance(value, (int, float)) else default
+    """Coerce an unknown value to float (handles Decimal-serialized strings)."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
 
 
 def _trajs(grouped: Mapping[str, list[Any]]) -> list[Any]:
@@ -200,8 +211,12 @@ def benchmark_test_split(
     """Freeze ``policy`` and compare it against all baselines on ``split``."""
     runner = EvaluationRunner(dataset, env_config, encoder, window_config)
     specs = build_test_episode_specs(
-        dataset, split=split, n_episodes=n_episodes, horizon=horizon,
-        context_length=window_config.context_length, seed=seed,
+        dataset,
+        split=split,
+        n_episodes=n_episodes,
+        horizon=horizon,
+        context_length=window_config.context_length,
+        seed=seed,
     )
     periods_per_year = runner.periods_per_year(split)
 
@@ -283,9 +298,7 @@ def _text_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
     return "\n".join(lines)
 
 
-def write_benchmark_results(
-    result: dict[str, Any], out_dir: str | Path
-) -> dict[str, Path]:
+def write_benchmark_results(result: dict[str, Any], out_dir: str | Path) -> dict[str, Path]:
     """Write JSON, agent/instrument/year CSVs, and a text table."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -342,9 +355,7 @@ def load_checkpoint_policy(
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     algorithm = state.get("algorithm", "sac")
     cfg = state.get("config", {})
-    exp_cfg = (
-        ExperimentConfig.from_dict(cfg) if isinstance(cfg, dict) else ExperimentConfig()
-    )
+    exp_cfg = ExperimentConfig.from_dict(cfg) if isinstance(cfg, dict) else ExperimentConfig()
     policy = build_policy_network(
         algorithm,
         obs_dim,

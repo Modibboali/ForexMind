@@ -101,8 +101,13 @@ def summarize_returns(returns: list[float]) -> dict[str, float]:
 def action_distribution(actions: np.ndarray) -> dict[str, float]:
     """Fraction of short/flat/long actions and mean |exposure|."""
     if len(actions) == 0:
-        return {"frac_short": 0.0, "frac_flat": 0.0, "frac_long": 0.0,
-                "mean_abs_exposure": 0.0, "mean_action": 0.0}
+        return {
+            "frac_short": 0.0,
+            "frac_flat": 0.0,
+            "frac_long": 0.0,
+            "mean_abs_exposure": 0.0,
+            "mean_action": 0.0,
+        }
     a = np.asarray(actions, dtype=np.float64)
     return {
         "frac_short": float(np.mean(a < -0.05)),

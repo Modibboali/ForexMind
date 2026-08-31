@@ -86,7 +86,11 @@ class TimeInfo:
 
 @dataclass(frozen=True, slots=True)
 class AccountState:
-    """Raw account/portfolio state exposed to the observation."""
+    """Raw account/portfolio state exposed to the observation.
+
+    All monetary fields are in ``account_currency``; ``raw_unrealized_pnl`` is
+    the quote-currency floating PnL before conversion.
+    """
 
     balance: Decimal
     equity: Decimal
@@ -98,6 +102,10 @@ class AccountState:
     margin_used: Decimal
     free_margin: Decimal
     drawdown: Decimal
+    account_currency: str = "USD"
+    base_currency: str = ""
+    quote_currency: str = ""
+    raw_unrealized_pnl: Decimal = Decimal("0")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -111,6 +119,10 @@ class AccountState:
             "margin_used": self.margin_used,
             "free_margin": self.free_margin,
             "drawdown": self.drawdown,
+            "account_currency": self.account_currency,
+            "base_currency": self.base_currency,
+            "quote_currency": self.quote_currency,
+            "raw_unrealized_pnl": self.raw_unrealized_pnl,
         }
 
 

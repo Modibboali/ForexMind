@@ -178,12 +178,15 @@ def _sac_trainer(tmp_path, *, alpha: float | str = "auto") -> SACTrainer:
     from tests.synthetic import make_instrument, make_split_dataset, timeline_m5
 
     dates = [
-        "2020-01-06", "2020-06-01", "2020-12-07",
-        "2021-03-01", "2021-09-01", "2022-03-01", "2022-09-01",
+        "2020-01-06",
+        "2020-06-01",
+        "2020-12-07",
+        "2021-03-01",
+        "2021-09-01",
+        "2022-03-01",
+        "2022-09-01",
     ]
-    ds = make_split_dataset(
-        {"EURUSD": make_instrument("EURUSD", timeline_m5(dates, per_day=40))}
-    )
+    ds = make_split_dataset({"EURUSD": make_instrument("EURUSD", timeline_m5(dates, per_day=40))})
     cfg = ExperimentConfig.smoke("sac")
     cfg.training.alpha = alpha
     cfg.environment.instruments = ("EURUSD",)

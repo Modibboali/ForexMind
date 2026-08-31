@@ -32,6 +32,15 @@ environment:
   spread: 0.0002
   commission: 0.0
   sizing_mode: equity_fraction
+  account_currency: USD
+  instrument_spreads:
+    EURUSD: 0.0002
+    GBPUSD: 0.0002
+    USDJPY: 0.02
+    USDCHF: 0.0002
+    AUDUSD: 0.0002
+    USDCAD: 0.0002
+    NZDUSD: 0.0002
   instruments: []
 
 compute:

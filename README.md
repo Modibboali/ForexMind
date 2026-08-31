@@ -161,14 +161,40 @@ because historical bid/ask is unavailable.
 Portfolio accounting uses `decimal.Decimal` with a fixed context precision
 (`DECIMAL_PRECISION = 50`) so results are exact and deterministic across runs.
 
-Conventions (mirroring a broker margin account):
+### Account currency (Phase 3.1)
+
+The simulator has an **explicit account currency** (`EnvironmentConfig.account_currency`,
+default **USD**). Every account-level monetary quantity — balance, equity,
+realized/unrealized PnL, gross exposure, margin, and drawdown — is expressed
+in that currency. The architecture supports `EUR`, `GBP`, `JPY`, `CHF`, `CAD`,
+`AUD`, `NZD` account currencies without rewriting the portfolio engine;
+conversion is delegated to the FX service (`forexmind/environment/fx_conversion.py`).
+
+### Pair representation
+
+Each instrument is represented as `BASE/QUOTE` (`1 BASE = price QUOTE`), with
+explicit metadata (`pip_size`, `price_precision`, `base_currency`,
+`quote_currency`) in `forexmind/environment/instruments.py` (e.g.
+`EURUSD` pip `0.0001`, `USDJPY` pip `0.01`).
+
+### PnL and conversion
+
+Raw trade PnL is computed in the instrument's **quote currency**:
+`PnL_quote = N * (P_exit - P_entry)`, then converted to the account currency
+before entering any account-level field. For a USD account:
+
+- USD-quote pairs (EURUSD, GBPUSD, AUDUSD, NZDUSD): `PnL_USD = PnL_quote` (no
+  conversion needed).
+- USD/XXX pairs (USDJPY, USDCHF, USDCAD): `PnL_USD = PnL_quote / USDXXX` using
+  the pair's own **contemporaneous** price (never future prices).
 
 ```
-balance          = initial + net realised PnL (changes only on closes/commissions)
-unrealized_pnl   = units * (mid - entry)              (floating PnL)
+balance          = initial + net realised PnL (account currency; closes/commissions only)
+raw_pnl_quote    = units * (mid - entry)              (quote currency)
+unrealized_pnl   = raw_pnl_quote * quote_to_account_factor   (account currency)
 equity           = balance + unrealized_pnl
 realized_pnl     = balance - initial
-gross_exposure   = |units| * price
+gross_exposure   = account-currency exposure (see below)
 ```
 
 The identity `equity - initial == realized + unrealized` holds to ~1e-48
@@ -180,19 +206,40 @@ Position transitions (`flat→long`, `flat→short`, `flat→flat`, `long→flat
 accounting for closed exposure and average-cost entry for same-direction
 increases.
 
+### Gross exposure (account currency)
+
+`gross_exposure = |units| * price * quote_to_account_factor`, so it is directly
+comparable with account equity. For USD/XXX pairs one base unit of USD is one
+USD of notional, so `gross_exposure ≈ |units|` regardless of the JPY/CHF/CAD
+price scale (e.g. USDJPY exposure `≈ |N|` USD).
+
 ### Margin & leverage (`MarginConfig`)
 
+All margin quantities are in the account currency — never JPY margin against
+USD equity:
+
 ```
-margin_used     = gross_exposure * margin_requirement   (default 1/leverage)
+margin_used     = gross_exposure_account * margin_requirement   (default 1/leverage)
 free_margin     = equity - margin_used
 margin_call     = free_margin < 0
 liquidation     = equity <= margin_used * maintenance_margin_ratio  (position open)
-max_leverage    = optional hard cap on gross_exposure / equity
+max_leverage    = optional hard cap on gross_exposure_account / equity
+leverage_used   = gross_exposure_account / equity   (dimensionless)
 ```
 
 Liquidation is **deterministic**: when triggered, the position is force-closed
 at the current mark price. No specific broker margin model is assumed — it is
 configuration-driven.
+
+### Execution costs
+
+Commission is defined as a quote-currency cost per base unit; the resulting
+commission is converted into the account currency before it affects
+balance/equity. Spread is configured **per instrument** (see
+`ExecutionConfig.instrument_spreads`) using each pair's correct pip size
+(e.g. JPY pairs `0.02` for 2 pips vs `0.0002` for non-JPY pairs), not one raw
+`0.0002` across every instrument. These are *configured assumptions* — the
+dataset has no historical bid/ask.
 
 ---
 
@@ -206,9 +253,13 @@ The action space is **target exposure**, not BUY/SELL/HOLD:
 ```
 
 The action means *"adjust the portfolio to the requested target exposure"*.
-Position sizing maps an exposure in `[-1, +1]` to base units:
+Position sizing maps an exposure in `[-1, +1]` to base units so that the
+**account-currency gross exposure** equals `|exposure| * equity`:
 
-- `equity_fraction` (default): `units = exposure * equity / execution_price`
+- `equity_fraction` (default, account-currency aware):
+  `units = (exposure * equity) / (price * quote_to_account_factor)`
+  For USD-quote pairs this is `exposure * equity / price`; for USD/XXX pairs
+  it is `≈ exposure * equity` (one base USD == one USD notional).
 - `fixed_units`: `units = exposure * fixed_units`
 
 This formulation maps naturally to discrete MuZero actions later and can be
@@ -218,16 +269,17 @@ extended to continuous targets.
 
 ## 8. Reward
 
-The Phase-1 reward is based on the change in account equity (transaction costs
-already reflected in equity):
+The reward is the log change in **account-currency** equity (transaction costs
+already reflected):
 
 ```
 reward_t = ln(equity_{t+1} / equity_t)
 ```
 
-The reward service is extensible for later experiments (risk-adjusted,
-drawdown-penalised, cost-penalised). Raw financial quantities are exposed
-independently of the reward via the environment `info`.
+Because P&L and margin are now currency-consistent, the reward is economically
+meaningful across all instruments. The reward service is extensible for later
+experiments (risk-adjusted, drawdown-penalised, cost-penalised). Raw financial
+quantities are exposed independently of the reward via the environment `info`.
 
 ---
 
@@ -362,6 +414,11 @@ periods (by design).
 
 - Historical bid/ask/tick data is unavailable; spread/slippage/commission are
   configurable assumptions, never inferred from OHLC.
+- **No historical overnight-financing (swap) data.** Phase 3.1 ships a
+  zero-cost `FinancingModel` interface only — no swap rates are fabricated.
+- **No fabricated cross rates.** The FX conversion service only converts via
+  the seven documented USD-major pairs; an unavailable conversion raises an
+  error rather than silently using `1.0`.
 - Source timezone is unknown (MT5 server time); session labels assume a
   configurable UTC offset (default 0).
 - One net position per instrument (no order book, no multi-position book).
@@ -369,7 +426,8 @@ periods (by design).
 - `STRICT` M5 bars require 5 contiguous M1 minutes; thin/holiday periods
   produce fewer M5 bars.
 - Commission/slippage models are simple and deterministic; pair-specific or
-  regime-dependent spreads are deferred.
+  regime-dependent spreads are deferred (per-instrument spreads are
+  configurable since Phase 3.1).
 - Prices are `float64` in the market-data layer (standard for quotes);
   accounting is `Decimal` with 50-digit precision.
 

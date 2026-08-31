@@ -53,24 +53,44 @@ def _resolve_checkpoint(args: argparse.Namespace) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a frozen training checkpoint.")
-    parser.add_argument("--checkpoint", type=str, default="best",
-                        help="Checkpoint path, a run dir, or a run name "
-                             "(e.g. 'runs/sac_cpu_seed42/checkpoints/best.pt', "
-                             "'runs/sac_cpu_seed42', or 'sac_cpu_seed42').")
-    parser.add_argument("--run-root", type=str, default=None,
-                        help="Root directory to search for run checkpoints "
-                             "(default: from the embedded config, else 'runs').")
-    parser.add_argument("--split", type=str, default="validation",
-                        choices=["validation", "test"],
-                        help="Which split to evaluate on.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="best",
+        help="Checkpoint path, a run dir, or a run name "
+        "(e.g. 'runs/sac_cpu_seed42/checkpoints/best.pt', "
+        "'runs/sac_cpu_seed42', or 'sac_cpu_seed42').",
+    )
+    parser.add_argument(
+        "--run-root",
+        type=str,
+        default=None,
+        help="Root directory to search for run checkpoints "
+        "(default: from the embedded config, else 'runs').",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="validation",
+        choices=["validation", "test"],
+        help="Which split to evaluate on.",
+    )
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--config", type=str, default=None,
-                        help="Optional YAML config (fallback: embedded in checkpoint).")
-    parser.add_argument("--benchmark", action="store_true",
-                        help="Also run the final SAC-vs-baselines benchmark on test.")
-    parser.add_argument("--out", type=str, default=None,
-                        help="Output directory for benchmark tables.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional YAML config (fallback: embedded in checkpoint).",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Also run the final SAC-vs-baselines benchmark on test.",
+    )
+    parser.add_argument(
+        "--out", type=str, default=None, help="Output directory for benchmark tables."
+    )
     args = parser.parse_args()
 
     checkpoint = _resolve_checkpoint(args)
@@ -106,7 +126,10 @@ def main() -> None:
     print(f"Loaded checkpoint: {checkpoint}")
 
     evaluator = PolicyEvaluator(
-        dataset, env_config, encoder, window_config,
+        dataset,
+        env_config,
+        encoder,
+        window_config,
         selection_metric=config.selection.metric,
         lambda_drawdown=config.selection.lambda_drawdown,
         eval_horizon=config.evaluation.eval_horizon,
@@ -114,8 +137,7 @@ def main() -> None:
         context_length=config.environment.context_length,
     )
     result = evaluator.evaluate(policy, algorithm, args.split, args.episodes)
-    print(f"\n=== {algorithm.upper()} frozen policy on {args.split} "
-          f"({args.episodes} episodes) ===")
+    print(f"\n=== {algorithm.upper()} frozen policy on {args.split} ({args.episodes} episodes) ===")
     for k, v in sorted(result.metrics.items()):
         print(f"  {k:<22} {v}")
 
@@ -132,11 +154,7 @@ def main() -> None:
             horizon=config.evaluation.eval_horizon,
             seed=args.seed if args.seed is not None else config.evaluation.eval_seed,
         )
-        out = (
-            Path(args.out)
-            if args.out
-            else checkpoint.resolve().parent.parent / "benchmark_test"
-        )
+        out = Path(args.out) if args.out else checkpoint.resolve().parent.parent / "benchmark_test"
         paths = write_benchmark_results(bench, out)
         print(f"\nBenchmark tables written to {out}:")
         for name, p in paths.items():

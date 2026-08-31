@@ -86,9 +86,7 @@ class SACTrainer(BaseTrainer):
             return
         if self.replay.size < self.config.training.batch_size:
             return
-        n_updates = max(
-            1, int(self.config.training.gradient_updates_per_step * len(transitions))
-        )
+        n_updates = max(1, int(self.config.training.gradient_updates_per_step * len(transitions)))
         for _ in range(n_updates):
             diag = self.update()
             self._gradient_updates += 1
@@ -106,9 +104,9 @@ class SACTrainer(BaseTrainer):
         act = torch.as_tensor(batch.action, device=self.device)
         rew = torch.as_tensor(batch.reward, device=self.device).unsqueeze(1)
         nxt = torch.as_tensor(batch.next_obs, device=self.device)
-        done = torch.as_tensor(
-            batch.terminated, device=self.device, dtype=torch.float32
-        ).unsqueeze(1)
+        done = torch.as_tensor(batch.terminated, device=self.device, dtype=torch.float32).unsqueeze(
+            1
+        )
 
         gamma = self.config.training.gamma
         alpha = self.log_alpha.exp()
@@ -184,9 +182,7 @@ class SACTrainer(BaseTrainer):
 
     def load_state(self, state: dict[str, Any]) -> None:
         if state.get("policy"):
-            self.actor.load_state_dict(
-                {k: torch.as_tensor(v) for k, v in state["policy"].items()}
-            )
+            self.actor.load_state_dict({k: torch.as_tensor(v) for k, v in state["policy"].items()})
         critics = state.get("critics", {}) or {}
         if critics.get("critic"):
             self.critic.load_state_dict(

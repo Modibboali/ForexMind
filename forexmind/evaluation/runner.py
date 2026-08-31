@@ -162,10 +162,22 @@ class EvaluationRunner:
             positions.append(_to_float(info["position_units"]))
 
             if _to_float(info.get("units_delta", 0.0)) != 0.0:
+                # Account-currency notional of this execution (Phase 3.1).
+                account_ccy = str(info.get("account_currency", "USD"))
+                quote_ccy = str(info.get("quote_currency", "USD"))
+                conversion_rate = _to_float(info.get("trade_conversion_rate", 1.0))
+                notional_acct = (
+                    _to_float(info["units_delta"]) * _to_float(info["execution_price"])
+                    if quote_ccy == account_ccy
+                    else abs(_to_float(info["units_delta"]))
+                )
                 trade_log.append(
                     {
                         "timestamp": str(obs.timestamp),
                         "instrument": spec.instrument,
+                        "base_currency": str(info.get("base_currency", "")),
+                        "quote_currency": quote_ccy,
+                        "account_currency": account_ccy,
                         "old_position": prev_units,
                         "new_position": _to_float(info["position_units"]),
                         "execution_price": (
@@ -174,6 +186,11 @@ class EvaluationRunner:
                             else None
                         ),
                         "units_delta": _to_float(info["units_delta"]),
+                        "raw_pnl": _to_float(info.get("raw_pnl", 0.0)),
+                        "raw_pnl_currency": str(info.get("raw_pnl_currency", quote_ccy)),
+                        "converted_pnl": _to_float(info.get("converted_pnl", 0.0)),
+                        "conversion_rate": conversion_rate,
+                        "notional_account": notional_acct,
                         "cost": _to_float(info.get("trade_cost", 0.0)),
                         "realized_pnl": _to_float(info.get("trade_realized_pnl", 0.0)),
                         "equity_after_trade": new_equity,

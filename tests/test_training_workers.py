@@ -50,12 +50,15 @@ def _dataset():
     from tests.synthetic import make_instrument, make_split_dataset, timeline_m5
 
     dates = [
-        "2020-01-06", "2020-06-01", "2020-12-07",
-        "2021-03-01", "2021-09-01", "2022-03-01", "2022-09-01",
+        "2020-01-06",
+        "2020-06-01",
+        "2020-12-07",
+        "2021-03-01",
+        "2021-09-01",
+        "2022-03-01",
+        "2022-09-01",
     ]
-    return make_split_dataset(
-        {"EURUSD": make_instrument("EURUSD", timeline_m5(dates, per_day=40))}
-    )
+    return make_split_dataset({"EURUSD": make_instrument("EURUSD", timeline_m5(dates, per_day=40))})
 
 
 def test_worker_episode_seed_deterministic() -> None:
@@ -104,7 +107,9 @@ def test_sync_collector_deterministic() -> None:
     from forexmind.training.policies import build_policy_network
 
     env_config = default_config(
-        initial_balance="10000", leverage=50, spread_value=0.0002,
+        initial_balance="10000",
+        leverage=50,
+        spread_value=0.0002,
         sizing_mode="equity_fraction",
     )
     encoder = ObservationEncoder(EncoderConfig(context_length=8, initial_balance="10000"))
@@ -115,10 +120,18 @@ def test_sync_collector_deterministic() -> None:
 
     def make():
         return EnvWorker(
-            dataset=ds, env_config=env_config, encoder_config=encoder.config,
-            window_config=window_config, episode_config=episode_config,
-            algorithm="sac", model_config=model, obs_dim=encoder.config.spec.encoded_shape[0],
-            action_dim=1, worker_id=0, global_seed=123, policy=policy,
+            dataset=ds,
+            env_config=env_config,
+            encoder_config=encoder.config,
+            window_config=window_config,
+            episode_config=episode_config,
+            algorithm="sac",
+            model_config=model,
+            obs_dim=encoder.config.spec.encoded_shape[0],
+            action_dim=1,
+            worker_id=0,
+            global_seed=123,
+            policy=policy,
         )
 
     c1 = SyncCollector(make())
@@ -168,7 +181,9 @@ def test_process_collector_start_stop_collect(tmp_path) -> None:
     ds = make_split_dataset({"EURUSD": inst})
 
     env_config = default_config(
-        initial_balance="10000", leverage=50, spread_value=0.0002,
+        initial_balance="10000",
+        leverage=50,
+        spread_value=0.0002,
         sizing_mode="equity_fraction",
     )
     encoder = ObservationEncoder(EncoderConfig(context_length=8, initial_balance="10000"))

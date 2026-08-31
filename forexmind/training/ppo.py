@@ -165,13 +165,9 @@ class PPOTrainer(BaseTrainer):
                 break
 
     def _all_params(self) -> list[nn.Parameter]:
-        return [p for p in self.actor.parameters()] + [
-            p for p in self._value_net.parameters()
-        ]
+        return [p for p in self.actor.parameters()] + [p for p in self._value_net.parameters()]
 
-    def _param_update_magnitude(
-        self, params_before: list[torch.Tensor]
-    ) -> tuple[float, float]:
+    def _param_update_magnitude(self, params_before: list[torch.Tensor]) -> tuple[float, float]:
         """Mean/max absolute parameter change over this rollout update."""
         deltas = [
             p.detach().sub(pb) for p, pb in zip(self._all_params(), params_before, strict=True)
@@ -405,16 +401,11 @@ class PPOTrainer(BaseTrainer):
                 kl_stop_epoch = epoch + 1
                 break
 
-        mean_abs_param_update, max_abs_param_update = self._param_update_magnitude(
-            params_before
-        )
+        mean_abs_param_update, max_abs_param_update = self._param_update_magnitude(params_before)
 
         if high_clip:
             self._clip_warn_count += 1
-            if (
-                self._clip_warn_count in (1, 5, 10, 20, 50)
-                or self._clip_warn_count % 100 == 0
-            ):
+            if self._clip_warn_count in (1, 5, 10, 20, 50) or self._clip_warn_count % 100 == 0:
                 print(
                     "[ppo] WARNING clip_fraction>0.95 in a minibatch "
                     f"(env_steps={self._env_steps:,}, count={self._clip_warn_count})",

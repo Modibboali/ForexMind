@@ -35,9 +35,7 @@ class ReplayBuffer:
     """Fixed-capacity numpy ring buffer (single-writer, multi-reader safe for
     the learner's own sampling)."""
 
-    def __init__(
-        self, obs_dim: int, capacity: int, action_dim: int = 1, seed: int = 0
-    ) -> None:
+    def __init__(self, obs_dim: int, capacity: int, action_dim: int = 1, seed: int = 0) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be > 0")
         self.obs_dim = obs_dim

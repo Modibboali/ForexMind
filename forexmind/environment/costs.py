@@ -36,15 +36,25 @@ class ExecutionPrices:
 
 
 class ExecutionCostModel:
-    """Deterministic spread / slippage / commission model."""
+    """Deterministic spread / slippage / commission model.
+
+    The model is instrument-aware: when a per-instrument spread override is
+    configured (``ExecutionConfig.instrument_spreads``), it is applied for that
+    instrument; otherwise the global ``spread_value`` is used.  This makes it
+    possible to use the correct pip size per pair (e.g. 0.01 for JPY pairs
+    instead of a single 0.0002 value).
+    """
 
     def __init__(self, config: ExecutionConfig) -> None:
         self.config = config
 
-    def execution_prices(self, mid_price: float | Decimal) -> ExecutionPrices:
+    def execution_prices(
+        self, mid_price: float | Decimal, instrument: str | None = None
+    ) -> ExecutionPrices:
         """Compute buy/sell prices around a mid price."""
         mid = _dec(mid_price)
-        half_spread = self.config.spread_decimal / 2
+        spread = self.config.spread_for(instrument) if instrument else self.config.spread_decimal
+        half_spread = spread / 2
         buy = mid + half_spread
         sell = mid - half_spread
         if self.config.slippage_mode == "fixed":
@@ -53,14 +63,20 @@ class ExecutionCostModel:
         return ExecutionPrices(mid=mid, buy=buy, sell=sell)
 
     def commission(self, units: float | int | Decimal) -> Decimal:
-        """Total commission for executing ``units`` (per side)."""
+        """Total commission for executing ``units`` (per side), quote currency.
+
+        The caller converts this to the account currency before applying it.
+        """
         return abs(_dec(units)) * self.config.commission_decimal
 
     def total_execution_charge(
-        self, units: float | int | Decimal, mid_price: float | Decimal
+        self,
+        units: float | int | Decimal,
+        mid_price: float | Decimal,
+        instrument: str | None = None,
     ) -> Decimal:
         """Quote-currency cost of executing ``units`` (incl. spread/slippage)."""
         units_d = _dec(units)
-        prices = self.execution_prices(mid_price)
+        prices = self.execution_prices(mid_price, instrument)
         unit_cost = prices.buy if units_d > 0 else prices.sell
         return abs(units_d) * (abs(unit_cost - prices.mid)) + self.commission(units_d)

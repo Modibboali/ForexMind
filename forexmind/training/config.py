@@ -74,6 +74,10 @@ class TrainingEnvConfig:
     commission: float = 0.0
     sizing_mode: str = "equity_fraction"
     instruments: tuple[str, ...] = ()  # empty = all available instruments
+    # Phase 3.1: explicit account currency + per-instrument spread overrides.
+    account_currency: str = "USD"
+    # instrument -> absolute spread in price units (e.g. JPY pairs 0.02).
+    instrument_spreads: dict[str, float] = field(default_factory=dict)
     # Numerical-stability reward bounds (see RewardConfig): the finite floor
     # replaces -inf on equity collapse so PPO GAE/normalization cannot NaN.
     min_reward: float = -50.0

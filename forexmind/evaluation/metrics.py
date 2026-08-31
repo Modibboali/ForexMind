@@ -197,11 +197,17 @@ def trade_statistics(
     wins = [float(e["realized_pnl"]) for e in trade_log if float(e["realized_pnl"]) > 0]
     losses = [float(e["realized_pnl"]) for e in trade_log if float(e["realized_pnl"]) < 0]
     costs = sum(float(e["cost"]) for e in trade_log)
+
+    def _notional(e: dict[str, Any]) -> float:
+        # Prefer explicit account-currency notional; fall back to quote-currency
+        # notional for older logs (correct for USD-quote pairs only).
+        if "notional_account" in e:
+            return abs(float(e["notional_account"]))
+        price = float(e["execution_price"]) if e.get("execution_price") is not None else 0.0
+        return abs(float(e["units_delta"])) * price
+
     turnover = (
-        sum(abs(float(e["units_delta"])) * float(e["execution_price"]) for e in trade_log)
-        / initial_balance
-        if initial_balance > 0
-        else 0.0
+        sum(_notional(e) for e in trade_log) / initial_balance if initial_balance > 0 else 0.0
     )
     steps = [int(e["step"]) for e in trade_log]
     durations = [b - a for a, b in itertools.pairwise(steps)]

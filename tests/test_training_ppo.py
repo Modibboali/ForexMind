@@ -368,9 +368,7 @@ def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
     def gauss_logpdf(a: torch.Tensor, mu: torch.Tensor, sig: torch.Tensor) -> torch.Tensor:
         return -0.5 * ((a - mu) / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
 
-    new_logp = torch.cat(
-        [gauss_logpdf(act_raw[i], mean[i], std[i]) for i in range(4)]
-    ).view(-1, 1)
+    new_logp = torch.cat([gauss_logpdf(act_raw[i], mean[i], std[i]) for i in range(4)]).view(-1, 1)
     entropy_manual = (0.5 * math.log(2 * math.pi * math.e) + torch.log(std)).mean()
 
     log_ratio_manual = torch.clamp(new_logp - old_logp, -10.0, 10.0)
@@ -382,8 +380,8 @@ def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
     surr2 = ratio_manual.clamp(1.0 - eps, 1.0 + eps) * adv
     actor_loss_manual = -(torch.min(surr1, surr2).mean() + ent_coef * entropy_manual)
 
-    actor_loss, ratio, approx_kl, approx_kl_log, clip_frac, entropy = (
-        trainer._minibatch_actor(dist, act_raw, old_logp, adv, eps=eps, ent_coef=ent_coef)
+    actor_loss, ratio, approx_kl, approx_kl_log, clip_frac, entropy = trainer._minibatch_actor(
+        dist, act_raw, old_logp, adv, eps=eps, ent_coef=ent_coef
     )
     np.testing.assert_allclose(ratio.detach().numpy(), ratio_manual.numpy(), rtol=1e-6)
     assert approx_kl == pytest.approx(approx_kl_manual, rel=1e-6)
