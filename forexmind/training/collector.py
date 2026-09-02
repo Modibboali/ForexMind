@@ -174,20 +174,13 @@ class EnvWorker:
                 )
                 obs_t = torch.as_tensor(last_obs, dtype=torch.float32).unsqueeze(0)
                 if self.algorithm == "ppo":
-                    from forexmind.training.networks import GaussianPolicy
+                    from forexmind.training.networks import TanhGaussianPolicy
 
-                    gauss = cast(GaussianPolicy, policy)
-                    dist = gauss(obs_t)
-                    raw = dist.sample()  # u ~ N(mean, std)
-                    action_env = torch.clamp(raw, -1.0, 1.0)  # projection for the env
-                    # The stored log-prob must be the density of the ACTUAL
-                    # sample ``u`` (the policy is a plain Gaussian over u; the
-                    # clamp is only an execution-time projection).  Evaluating
-                    # N() at the clamped boundary instead makes old/new
-                    # log-probs not correspond to the sampling distribution
-                    # and can drive the PPO ratio to diverge.  The env action
-                    # stays clamped - the trading semantics are unchanged.
-                    log_prob = float(dist.log_prob(raw).sum().item())
+                    tanh_policy = policy
+                    # Sample action with Jacobian-corrected log-prob
+                    action, logp, raw = tanh_policy.log_prob_and_raw(obs_t, deterministic=False)
+                    action_env = torch.tanh(raw)  # Guaranteed ∈ (-1, 1), no clamping needed
+                    log_prob = float(logp.item())
                     value = float(value_net(obs_t).item()) if value_net is not None else 0.0
                     action_f = float(action_env.item())
                     action_raw_f = float(raw.item())

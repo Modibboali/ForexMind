@@ -21,6 +21,7 @@ from forexmind.training.networks import (
     LOG_STD_MAX,
     LOG_STD_MIN,
     GaussianPolicy,
+    TanhGaussianPolicy,
     SquashedGaussianActor,
 )
 
@@ -56,17 +57,25 @@ def sample_action(
     deterministic: bool = False,
     device: str | torch.device = "cpu",
 ) -> float:
-    """Sample (or deterministically select) a target exposure from a flat obs."""
+    """Sample (or deterministically select) a target exposure from a flat obs.
+
+    For PPO: The tanh-squashed Gaussian policy naturally produces actions in (-1, 1).
+    No clamping is required (tanh is strictly bounded).
+
+    For SAC: The SquashedGaussianActor also uses tanh and produces actions in (-1, 1).
+
+    Returns a float in (-1, 1).
+    """
     obs = torch.as_tensor(np.asarray(obs_flat, dtype=np.float32), device=device).unsqueeze(0)
     if algorithm == "sac":
         sac_policy = cast(SquashedGaussianActor, policy)
         action = sac_policy.deterministic(obs) if deterministic else sac_policy.sample(obs)[0]
     elif algorithm == "ppo":
-        ppo_policy = cast(GaussianPolicy, policy)
+        ppo_policy = cast(TanhGaussianPolicy, policy)
         action = ppo_policy.act(obs, deterministic=deterministic)
     else:  # pragma: no cover - guarded in build_policy_network
         raise ValueError(f"unsupported algorithm {algorithm!r}")
-    return float(torch.clamp(action, -1.0, 1.0).item())
+    return float(action.item())
 
 
 class PolicyAgent:

@@ -99,12 +99,29 @@ class TwinQCritic(nn.Module):
         return self.q1(x), self.q2(x)
 
 
-class GaussianPolicy(nn.Module):
-    """PPO Gaussian policy (mean + learned log-std), continuous actions.
+class TanhGaussianPolicy(nn.Module):
+    """PPO tanh-squashed Gaussian policy (mean + learned log-std), continuous actions.
 
-    The action is a clamped Gaussian sample (clamped to [-1, 1] at execution).
-    ``log_std`` is a single learned parameter bounded to ``[log_std_min,
-    log_std_max]`` so ``exp(log_std)`` cannot silently overflow.
+    **Mathematically correct bounded continuous policy:**
+
+    1. Sample raw: ``u ~ N(μ, σ)`` where ``(μ, σ) = policy_net(obs)``
+    2. Transform: ``a = tanh(u)`` where ``a ∈ (-1, 1)`` (strictly bounded)
+    3. Log-prob with Jacobian: ``log π(a|s) = log N(u) - Σ log(1 - tanh²(u) + ε)``
+
+    The environment receives ``a`` directly (no clamping to boundary).
+
+    **Deterministic action:** ``a = tanh(μ)`` (mean of the raw Gaussian)
+
+    **Why tanh-squashing instead of clamping:**
+    - Gaussian + clamp loses information (multiple raw samples → same boundary action)
+    - Tanh is differentiable everywhere, smooth log-prob gradient
+    - Jacobian correction ensures log-prob matches actual action distribution
+    - Numerically stable with ε in log(1 - tanh²(u) + ε)
+
+    **Storage requirements:**
+    - Store raw sample ``u`` for replay/PPO updates (can reconstruct log-prob)
+    - Store transformed action ``a`` for environment (trading semantics)
+    - Store log-prob for efficiency (avoid recomputation during PPO update)
     """
 
     def __init__(
@@ -124,29 +141,78 @@ class GaussianPolicy(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
     def forward(self, obs: torch.Tensor) -> torch.distributions.Normal:
+        """Return the base Normal distribution N(μ, σ) over the raw (pre-tanh) action."""
         return self.dist(obs)
 
     def dist(self, obs: torch.Tensor) -> torch.distributions.Normal:
+        """Build the Normal distribution for raw actions."""
         mean = self.mean_net(obs)
         log_std = self.log_std.expand_as(mean).clamp(self.log_std_min, self.log_std_max)
         return torch.distributions.Normal(mean, log_std.exp())
 
     def act(self, obs: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        dist = self.dist(obs)
-        action = dist.mean if deterministic else dist.sample()
-        return torch.clamp(action, -1.0, 1.0)
+        """Sample action (deterministic or stochastic).
 
-    def evaluate(
-        self, obs: torch.Tensor, action: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Plain Gaussian density on the (clamped) action.  No tanh-squash
-        # correction: the action is clamped, not tanh-squashed, so applying a
-        # tanh Jacobian correction here would be inconsistent with the density
-        # used during the PPO update.
+        Returns the transformed action a = tanh(u), ready for the environment.
+        Clamping is NOT applied; tanh naturally bounds to (-1, 1).
+        """
         dist = self.dist(obs)
-        raw_action = torch.clamp(action, -1.0 + 1e-6, 1.0 - 1e-6)
-        log_prob = dist.log_prob(raw_action)
+        raw = dist.mean if deterministic else dist.rsample()
+        return torch.tanh(raw)
+
+    def log_prob_and_raw(
+        self, obs: torch.Tensor, deterministic: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample raw action and compute log-probability with Jacobian correction.
+
+        Returns:
+            (action, log_prob, raw_action) where:
+            - action: tanh-transformed action ∈ (-1, 1), ready for environment
+            - log_prob: log π(a|s) = log N(u) - Σ log(1 - tanh²(u) + ε)
+            - raw_action: u ~ N(μ, σ), stored for replay/PPO updates
+        """
+        dist = self.dist(obs)
+        raw = dist.mean if deterministic else dist.rsample()
+        action = torch.tanh(raw)
+
+        # Log-probability with Jacobian correction for tanh transformation.
+        # log π(a) = log N(u) - log |∂a/∂u|
+        # where |∂a/∂u| = 1 - tanh²(u)
+        log_prob_raw = dist.log_prob(raw)
+        log_det_jacobian = torch.log(1.0 - action.pow(2) + 1e-6)
+        log_prob = log_prob_raw - log_det_jacobian
+        return action, log_prob.sum(-1, keepdim=True), raw
+
+    def evaluate(self, obs: torch.Tensor, raw_action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate log-prob at a given raw action (for PPO updates).
+
+        During PPO training, we must evaluate log π(a|s) using the raw action ``u``
+        that was originally sampled, not the transformed action ``a``.  This is
+        critical for the importance ratio to be defined over the actual sampling
+        distribution.
+
+        Args:
+            obs: Observation batch (batch_size, obs_dim)
+            raw_action: Raw pre-tanh action (batch_size, action_dim)
+
+        Returns:
+            (log_prob, entropy) where log_prob includes Jacobian correction
+        """
+        dist = self.dist(obs)
+
+        # Compute log-prob of the raw action under the base Gaussian
+        log_prob_raw = dist.log_prob(raw_action)
+
+        # Apply tanh Jacobian correction using the transformed action
+        action = torch.tanh(raw_action)
+        log_det_jacobian = torch.log(1.0 - action.pow(2) + 1e-6)
+        log_prob = log_prob_raw - log_det_jacobian
+
         return log_prob.sum(-1, keepdim=True), dist.entropy().sum(-1, keepdim=True)
+
+
+# For backward compatibility: GaussianPolicy is now TanhGaussianPolicy
+GaussianPolicy = TanhGaussianPolicy
 
 
 class ValueNet(nn.Module):

@@ -179,7 +179,7 @@ class PPOTrainer(BaseTrainer):
 
     def _minibatch_actor(
         self,
-        dist: Any,
+        obs: torch.Tensor,
         act_raw: torch.Tensor,
         old_logp: torch.Tensor,
         adv: torch.Tensor,
@@ -189,26 +189,33 @@ class PPOTrainer(BaseTrainer):
     ) -> tuple[torch.Tensor, torch.Tensor, float, float, float, torch.Tensor]:
         """Clipped PPO actor surrogate for one minibatch.
 
-        ``act_raw`` is the pre-clamp Gaussian sample, so ``logp = log pi_theta
-        (u)`` is the density of the actual sampling distribution (not the
-        clamped boundary).  Returns ``(actor_loss, ratio, approx_kl,
-        approx_kl_log, clip_fraction, entropy)`` where
+        ``act_raw`` is the pre-tanh Gaussian sample ``u ~ N(μ, σ)``.
+        New log-prob is computed from the current policy with proper tanh
+        Jacobian correction:
 
-        * ``approx_kl    = E[0.5 (r - 1)^2]``      (kept for continuity)
-        * ``approx_kl_log = E[r - 1 - log r]``      (standard KL estimate,
-           used for target-KL early stopping)
+            log π(a|s) = log N(u) - Σ log(1 - tanh²(u) + ε)
+
+        Returns ``(actor_loss, ratio, approx_kl, approx_kl_log, clip_fraction, entropy)``
+        where:
+
+        * ``ratio = exp(new_log_prob - old_log_prob)`` (PPO importance ratio)
+        * ``approx_kl = E[0.5 (ratio - 1)²]`` (KL divergence estimate)
+        * ``approx_kl_log = E[ratio - 1 - log(ratio)]`` (log-space KL estimate for target-KL early stopping)
         """
-        logp = dist.log_prob(act_raw).sum(-1, keepdim=True)
-        log_ratio = (logp - old_logp).clamp(-LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
+        # Compute log-prob at raw action using current policy (with Jacobian correction)
+        new_logp, entropy = self.actor.evaluate(obs, act_raw)
+
+        log_ratio = (new_logp - old_logp).clamp(-LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
         ratio = log_ratio.exp()
         approx_kl = float((0.5 * (ratio - 1.0).pow(2)).mean().item())
         approx_kl_log = float(((ratio - 1.0) - log_ratio).mean().item())
         clip_frac = float(((ratio - 1.0).abs() > eps).float().mean().item())
-        entropy = dist.entropy().sum(-1, keepdim=True).mean()
+        entropy_mean = entropy.mean()
+
         surr1 = ratio * adv
         surr2 = ratio.clamp(1.0 - eps, 1.0 + eps) * adv
-        actor_loss = -(torch.min(surr1, surr2).mean() + ent_coef * entropy)
-        return actor_loss, ratio, approx_kl, approx_kl_log, clip_frac, entropy
+        actor_loss = -(torch.min(surr1, surr2).mean() + ent_coef * entropy_mean)
+        return actor_loss, ratio, approx_kl, approx_kl_log, clip_frac, entropy_mean
 
     # -- GAE ------------------------------------------------------------------
 
@@ -340,7 +347,7 @@ class PPOTrainer(BaseTrainer):
 
                 actor_loss, _ratio, approx_kl, approx_kl_log, clip_frac, entropy = (
                     self._minibatch_actor(
-                        dist,
+                        obs_t[idx],
                         act_raw_t[idx],
                         old_logp_t[idx],
                         adv_t[idx],
