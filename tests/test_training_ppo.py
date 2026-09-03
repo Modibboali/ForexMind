@@ -266,7 +266,7 @@ def test_inf_reward_poisons_gae_without_guard(tmp_path) -> None:
 
 def test_ppo_update_diagnostics_and_grad_clip(tmp_path) -> None:
     trainer = _trainer(tmp_path, max_grad_norm=0.5, finite_check=False)
-    transitions = [trainer.collector.worker.step(random_action=False) for _ in range(64)]
+    transitions = trainer.collector.collect(64, random_action=False)
     trainer._rollout = transitions
     diag = trainer.update()
     expected = (
@@ -307,7 +307,7 @@ def test_ppo_update_diagnostics_and_grad_clip(tmp_path) -> None:
 
 def test_ppo_grad_clip_disabled_allows_large_norm(tmp_path) -> None:
     trainer = _trainer(tmp_path, max_grad_norm=0.0, finite_check=False)
-    transitions = [trainer.collector.worker.step(random_action=False) for _ in range(64)]
+    transitions = trainer.collector.collect(64, random_action=False)
     trainer._rollout = transitions
     diag = trainer.update()
     assert "actor_grad_norm" in diag  # mechanism runs without clipping
@@ -340,14 +340,14 @@ def test_ppo_worker_logprob_consistent_with_trainer(tmp_path) -> None:
     t = trainer.collector.worker.step(random_action=False)
     obs_t = torch.as_tensor(t.obs, dtype=torch.float32).unsqueeze(0)
     raw_t = torch.as_tensor([[t.action_raw]], dtype=torch.float32)
-    
+
     # Evaluate log-prob using the policy (with Jacobian correction)
     expected_logp, _ = trainer.actor.evaluate(obs_t, raw_t)
-    
+
     # The stored log-prob must match (with numerical tolerance)
     assert abs(t.log_prob - float(expected_logp.item())) < 1e-5, \
         f"Stored log-prob {t.log_prob} != expected {expected_logp.item()}"
-    
+
     # The env-facing action is the tanh-transformed value (naturally in (-1, 1))
     assert -1.0 < t.action < 1.0, f"Action {t.action} not in (-1, 1)"
     assert abs(t.action - float(torch.tanh(raw_t).item())) < 1e-6, \
@@ -364,11 +364,11 @@ def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
     4. Clipping works as expected
     """
     trainer = _trainer(tmp_path, ppo_epochs=1)
-    
+
     # Create random obs and raw actions
     obs = torch.randn(4, trainer.obs_dim)
     act_raw = torch.randn(4, 1)
-    
+
     # Create plausible old log-probs
     old_logp = torch.randn(4, 1)
     adv = torch.randn(4, 1)
@@ -379,7 +379,7 @@ def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
     actor_loss, ratio, approx_kl, approx_kl_log, clip_frac, entropy = trainer._minibatch_actor(
         obs, act_raw, old_logp, adv, eps=eps, ent_coef=ent_coef
     )
-    
+
     # Verify properties
     assert torch.isfinite(actor_loss), "Actor loss must be finite"
     assert torch.all(torch.isfinite(ratio)), "Ratio must be finite"
@@ -387,11 +387,11 @@ def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
     assert np.isfinite(approx_kl), "KL must be finite"
     assert np.isfinite(approx_kl_log), "KL log must be finite"
     assert 0 <= clip_frac <= 1, f"Clip fraction must be in [0,1], got {clip_frac}"
-    
+
     # Ratios should be reasonable (not extreme)
     assert torch.all(ratio > 0.0), "Ratio must be positive"
     assert torch.all(ratio < 100.0), "Ratio should be reasonable"
-    
+
     # KL should be non-negative
     assert approx_kl >= 0, "KL must be non-negative"
 
@@ -399,7 +399,7 @@ def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
 def test_ppo_target_kl_early_stop(tmp_path) -> None:
     """A tiny target-KL must stop the remaining PPO epochs for the rollout."""
     trainer = _trainer(tmp_path, ppo_epochs=8, ppo_target_kl=1e-6, finite_check=False)
-    transitions = [trainer.collector.worker.step(random_action=False) for _ in range(64)]
+    transitions = trainer.collector.collect(64, random_action=False)
     trainer._rollout = transitions
     diag = trainer.update()
     assert diag["early_stop_kl"] == 1.0
@@ -415,16 +415,16 @@ def test_gaussian_policy_evaluate_matches_dist_logprob() -> None:
     policy = GaussianPolicy(5, 1, model)
     obs = torch.randn(3, 5)
     raw = torch.randn(3, 1)  # Raw pre-tanh action
-    
+
     # Expected: log N(u) - log(1 - tanh²(u) + ε)
     dist = policy.dist(obs)
     action_transformed = torch.tanh(raw)
     expected_logp = dist.log_prob(raw).sum(-1, keepdim=True) - \
                     torch.log(1.0 - action_transformed.pow(2) + 1e-6)
-    
+
     # Actual: policy.evaluate()
     lp, _ = policy.evaluate(obs, raw)
-    
+
     np.testing.assert_allclose(
         lp.detach().numpy(),
         expected_logp.detach().numpy(),

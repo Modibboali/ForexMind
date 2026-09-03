@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
 from abc import ABC, abstractmethod
 from contextlib import suppress
@@ -135,8 +136,8 @@ class BaseTrainer(ABC):
         self.metric_store = MetricStore()
         self.logger = TrainerLogger(verbose=True)
         self.checkpoints = CheckpointManager(self.run_dir)
-        self._episode_reward = 0.0
-        self._episode_steps = 0
+        self._episode_reward_by_worker: dict[int, float] = {}
+        self._episode_steps_by_worker: dict[int, int] = {}
         self._episode_returns: list[float] = []
         self._episode_lengths: list[int] = []
         self._recent_actions: list[float] = []
@@ -171,6 +172,16 @@ class BaseTrainer(ABC):
     def value_net(self) -> nn.Module | None:
         """Optional critic/value network to also sync to the workers (PPO)."""
         return None
+
+    @property
+    def env_steps(self) -> int:
+        """Number of environment transitions consumed by the trainer."""
+        return self._env_steps
+
+    @property
+    def gradient_updates(self) -> int:
+        """Number of learner optimizer updates completed by the trainer."""
+        return self._gradient_updates
 
     # -- device ---------------------------------------------------------------
 
@@ -349,6 +360,25 @@ class BaseTrainer(ABC):
             self._setup_signal_handler()
             if resume is not None:
                 self._restore_from_checkpoint(resume)
+                if self._env_steps >= self.config.training.total_env_steps:
+                    target = self.config.training.total_env_steps
+                    print(
+                        "Resume target:\n"
+                        f"  current_env_steps = {self._env_steps}\n"
+                        f"  target_env_steps  = {target}\n"
+                        "  remaining_steps   = 0\n"
+                        "No training performed: checkpoint already meets/exceeds target.",
+                        flush=True,
+                    )
+                    return self._finalize_no_training()
+                remaining = self.config.training.total_env_steps - self._env_steps
+                print(
+                    "Resume target:\n"
+                    f"  current_env_steps = {self._env_steps}\n"
+                    f"  target_env_steps  = {self.config.training.total_env_steps}\n"
+                    f"  remaining_steps   = {remaining}",
+                    flush=True,
+                )
             # Attach the policy to the collector (workers start acting with it).
             self._sync_policy_to_workers()
             self._log_startup()
@@ -365,6 +395,7 @@ class BaseTrainer(ABC):
                 total,
                 desc=f"{self.config.algorithm.name.upper()} training",
                 unit=" env steps",
+                initial=self._env_steps,
             )
             with bar:
                 while self._env_steps < total:
@@ -391,6 +422,8 @@ class BaseTrainer(ABC):
             # can be resumed.  Re-raise afterwards so the caller sees the error.
             with suppress(Exception):
                 self._rescue_checkpoint()
+            with suppress(Exception):
+                self.collector.close()
             raise
 
     def _setup_signal_handler(self) -> None:
@@ -430,16 +463,20 @@ class BaseTrainer(ABC):
         """Bookkeeping for collected transitions (env steps, episode returns)."""
         self._producer_worker_ids.update(t.worker_id for t in transitions)
         for t in transitions:
+            worker_id = int(t.worker_id)
+            if worker_id not in self._episode_reward_by_worker:
+                self._episode_reward_by_worker[worker_id] = 0.0
+                self._episode_steps_by_worker[worker_id] = 0
             self._env_steps += 1
-            self._episode_reward += t.reward
-            self._episode_steps += 1
+            self._episode_reward_by_worker[worker_id] += t.reward
+            self._episode_steps_by_worker[worker_id] += 1
             self._recent_actions.append(t.action)
             self._recent_rewards.append(t.reward)
             if t.terminated or t.truncated:
-                self._episode_returns.append(self._episode_reward)
-                self._episode_lengths.append(self._episode_steps)
-                self._episode_reward = 0.0
-                self._episode_steps = 0
+                self._episode_returns.append(self._episode_reward_by_worker[worker_id])
+                self._episode_lengths.append(self._episode_steps_by_worker[worker_id])
+                self._episode_reward_by_worker[worker_id] = 0.0
+                self._episode_steps_by_worker[worker_id] = 0
                 self._episodes += 1
             if len(self._recent_actions) > 10000:
                 self._recent_actions = self._recent_actions[-5000:]
@@ -481,6 +518,17 @@ class BaseTrainer(ABC):
                 "Recent mean episode length": round(float(np.mean(self._recent_lengths())), 2),
             }
             for k in ("actor_loss", "critic_loss", "alpha", "entropy", "q1"):
+                if k in diag:
+                    fields[k] = round(diag[k], 6)
+            for k in (
+                "rollout_transitions",
+                "unique_trajectories",
+                "rollout_completed_episodes",
+                "advantage_mean",
+                "advantage_std",
+                "advantage_min",
+                "advantage_max",
+            ):
                 if k in diag:
                     fields[k] = round(diag[k], 6)
             self.metric_store.record(
@@ -588,7 +636,23 @@ class BaseTrainer(ABC):
             episodes=self._episodes,
             config=self.config,
             dataset_version=self.config.dataset_version,
-            rng_state={"replay_meta": self.state_dicts().get("replay_meta", {})},
+            best_validation_score=self.best_score,
+            best_checkpoint=self.best_checkpoint,
+            validation_history=self.validation_history,
+            trainer_state={
+                "episode_reward_by_worker": dict(self._episode_reward_by_worker),
+                "episode_steps_by_worker": dict(self._episode_steps_by_worker),
+                "episode_returns": list(self._episode_returns),
+                "episode_lengths": list(self._episode_lengths),
+            },
+            rng_state={
+                "replay_meta": self.state_dicts().get("replay_meta", {}),
+                "numpy_global": np.random.get_state(),
+                "python": random.getstate(),
+                "torch": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                "trainer_local": self._local_rng_state(),
+            },
         )
         self.checkpoints.save(tag, state)
 
@@ -598,7 +662,73 @@ class BaseTrainer(ABC):
         self._env_steps = int(state.get("env_steps", 0))
         self._gradient_updates = int(state.get("gradient_updates", 0))
         self._episodes = int(state.get("episodes", 0))
+        best_score = state.get("best_validation_score")
+        if best_score is None:
+            print("[resume] best_validation_score unavailable in checkpoint; using -inf fallback")
+        else:
+            self.best_score = float(best_score)
+        if "best_checkpoint" in state:
+            self.best_checkpoint = state.get("best_checkpoint")
+        self.validation_history = list(state.get("validation_history", []) or [])
+        trainer_state = state.get("trainer_state", {}) or {}
+        rewards = trainer_state.get("episode_reward_by_worker", {}) or {}
+        steps = trainer_state.get("episode_steps_by_worker", {}) or {}
+        self._episode_reward_by_worker = {int(k): float(v) for k, v in dict(rewards).items()}
+        self._episode_steps_by_worker = {int(k): int(v) for k, v in dict(steps).items()}
+        self._episode_returns = [float(v) for v in trainer_state.get("episode_returns", []) or []]
+        self._episode_lengths = [int(v) for v in trainer_state.get("episode_lengths", []) or []]
+        self._restore_rng_state(state.get("rng", {}) or {})
         print(f"Resumed from {path} at env_steps={self._env_steps}")
+
+    def _local_rng_state(self) -> dict[str, Any]:
+        return {}
+
+    def _load_local_rng_state(self, state: dict[str, Any]) -> None:
+        return None
+
+    def _restore_rng_state(self, rng_state: dict[str, Any]) -> None:
+        if not rng_state:
+            print("[resume] RNG state unavailable in checkpoint; using freshly seeded RNGs")
+            return
+        try:
+            if "numpy_global" in rng_state:
+                np.random.set_state(rng_state["numpy_global"])
+            if "python" in rng_state:
+                random.setstate(rng_state["python"])
+            if "torch" in rng_state:
+                torch.set_rng_state(rng_state["torch"])
+            if torch.cuda.is_available() and rng_state.get("torch_cuda"):
+                torch.cuda.set_rng_state_all(rng_state["torch_cuda"])
+            self._load_local_rng_state(dict(rng_state.get("trainer_local", {}) or {}))
+        except Exception as exc:
+            print(f"[resume] could not restore full RNG state ({exc}); continuing with seeded RNGs")
+
+    def _finalize_no_training(self) -> dict[str, Any]:
+        workers_alive = getattr(self.collector, "alive_workers", 0)
+        self.collector.close()
+        summary = {
+            "status": "already_complete",
+            "algorithm": self.config.algorithm.name,
+            "env_steps": self._env_steps,
+            "gradient_updates": self._gradient_updates,
+            "episodes": self._episodes,
+            "best_checkpoint": self.best_checkpoint,
+            "best_validation_score": self.best_score,
+            "wall_seconds": 0.0,
+            "steps_per_second": 0.0,
+            "workers_configured": self._resolved_num_workers,
+            "workers_alive_at_finalize": workers_alive,
+            "workers_producing_transitions": len(self._producer_worker_ids),
+            "dataset_backend": getattr(self, "dataset_backend", "unknown"),
+            "warnings": self._collect_warnings(),
+            "message": "No training performed: checkpoint already meets/exceeds target.",
+        }
+        self.metric_store.to_csv(self.run_dir / "learning_curve.csv")
+        self.metric_store.to_jsonl(self.run_dir / "training_log.jsonl")
+        (self.run_dir / "training_summary.json").write_text(
+            json.dumps(summary, indent=2, default=str), encoding="utf-8"
+        )
+        return summary
 
     def _log_startup(self) -> None:
         from forexmind.training.data import dataset_summary

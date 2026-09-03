@@ -32,14 +32,14 @@ class CheckpointManager:
         return path
 
     def load(self, path: str | Path) -> dict[str, Any]:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        resolved = resolve_resume_checkpoint(path)
+        return torch.load(resolved, map_location="cpu", weights_only=False)
 
     def latest_path(self) -> Path | None:
         marker = self.run_dir / "checkpoints" / "latest.txt"
-        if marker.is_file():
-            p = self.run_dir / "checkpoints" / marker.read_text(encoding="utf-8").strip()
-            if p.is_file():
-                return p
+        pointed = _checkpoint_from_marker(marker)
+        if pointed is not None:
+            return pointed
         # Fallback: newest *.pt
         pts = sorted(self.run_dir.glob("checkpoints/*.pt"), key=lambda p: p.stat().st_mtime)
         return pts[-1] if pts else None
@@ -62,6 +62,55 @@ def discover_checkpoints(run_root: str | Path) -> list[Path]:
     return pts
 
 
+def _checkpoint_from_marker(marker: Path) -> Path | None:
+    """Return the checkpoint named by a ``latest.txt`` marker, if valid."""
+    if not marker.is_file():
+        return None
+    name = marker.read_text(encoding="utf-8").strip()
+    if not name:
+        return None
+    pointed = Path(name)
+    if not pointed.is_absolute():
+        pointed = marker.parent / pointed
+    return pointed if pointed.is_file() else None
+
+
+def resolve_resume_checkpoint(checkpoint_arg: str | Path) -> Path:
+    """Resolve an exact checkpoint, run directory, or latest-pointer alias.
+
+    ``latest.pt`` is accepted as a compatibility alias for the actual
+    ``latest.txt`` pointer written by :class:`CheckpointManager`.
+    """
+    given = Path(checkpoint_arg)
+    if given.is_file():
+        if given.name == "latest.txt":
+            pointed = _checkpoint_from_marker(given)
+            if pointed is None:
+                raise FileNotFoundError(f"checkpoint marker {given} is empty or stale")
+            return pointed
+        return given
+
+    if given.name == "latest.pt":
+        pointed = _checkpoint_from_marker(given.with_name("latest.txt"))
+        if pointed is not None:
+            return pointed
+
+    if given.is_dir():
+        for marker in (given / "checkpoints" / "latest.txt", given / "latest.txt"):
+            pointed = _checkpoint_from_marker(marker)
+            if pointed is not None:
+                return pointed
+        newest = discover_checkpoints(given)
+        if newest:
+            return newest[0]
+        raise FileNotFoundError(f"no resumable checkpoint found inside directory {given}")
+
+    raise FileNotFoundError(
+        f"resume checkpoint {given!s} not found; provide a .pt file, latest.txt, "
+        "the documented latest.pt alias, or a run directory"
+    )
+
+
 def resolve_checkpoint(
     checkpoint_arg: str | Path,
     run_root: str | Path | None = None,
@@ -70,7 +119,7 @@ def resolve_checkpoint(
 
     Accepts (in order of preference):
     * an exact path to a ``.pt`` file,
-    * a directory → its ``best.pt``, ``latest.pt``, or newest ``*.pt``,
+    * a directory -> its ``best.pt``, ``latest.txt`` target, or newest ``*.pt``,
     * a run name (e.g. ``sac_cpu_seed42``) searched under ``run_root``,
     * a bare name like ``best.pt`` / ``latest.pt`` searched under ``run_root``.
 
@@ -80,17 +129,24 @@ def resolve_checkpoint(
     given = Path(checkpoint_arg)
 
     if given.is_file():
+        if given.name == "latest.txt":
+            pointed = _checkpoint_from_marker(given)
+            if pointed is None:
+                raise FileNotFoundError(f"checkpoint marker {given} is empty or stale")
+            return pointed
         return given
     if given.is_dir():
         # Prefer the CheckpointManager layout: <dir>/checkpoints/{best,latest}.pt
         for cand in (
             given / "checkpoints" / "best.pt",
-            given / "checkpoints" / "latest.pt",
             given / "best.pt",
-            given / "latest.pt",
         ):
             if cand.is_file():
                 return cand
+        for marker in (given / "checkpoints" / "latest.txt", given / "latest.txt"):
+            pointed = _checkpoint_from_marker(marker)
+            if pointed is not None:
+                return pointed
         newest = discover_checkpoints(given)
         if newest:
             return newest[0]
@@ -104,16 +160,23 @@ def resolve_checkpoint(
         for c in all_found:
             if c.name == given.name:
                 return c
+        if given.name == "latest.pt":
+            for marker in sorted(root.rglob("latest.txt")) if root is not None else ():
+                pointed = _checkpoint_from_marker(marker)
+                if pointed is not None:
+                    return pointed
         raise FileNotFoundError(_not_found_msg(given, root, all_found))
 
-    # Run name → <root>/<given>/checkpoints/{best,latest}.pt
+    # Run name -> <root>/<given>/checkpoints/best.pt or latest.txt target.
     if root is not None:
         run_dir = root / given
         if run_dir.is_dir():
-            for name in ("best.pt", "latest.pt"):
-                cand = run_dir / "checkpoints" / name
-                if cand.is_file():
-                    return cand
+            cand = run_dir / "checkpoints" / "best.pt"
+            if cand.is_file():
+                return cand
+            pointed = _checkpoint_from_marker(run_dir / "checkpoints" / "latest.txt")
+            if pointed is not None:
+                return pointed
             in_run = discover_checkpoints(run_dir)
             if in_run:
                 raise FileNotFoundError(
@@ -153,6 +216,10 @@ def build_checkpoint_state(
     config: Any,
     dataset_version: str,
     rng_state: dict[str, Any],
+    best_validation_score: float | None = None,
+    best_checkpoint: str | None = None,
+    validation_history: list[dict[str, Any]] | None = None,
+    trainer_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble a serializable checkpoint dict."""
     return {
@@ -165,6 +232,10 @@ def build_checkpoint_state(
         "env_steps": env_steps,
         "gradient_updates": gradient_updates,
         "episodes": episodes,
+        "best_validation_score": best_validation_score,
+        "best_checkpoint": best_checkpoint,
+        "validation_history": validation_history or [],
+        "trainer_state": trainer_state or {},
         "config": config.to_dict() if hasattr(config, "to_dict") else config,
         "dataset_version": dataset_version,
         "rng": rng_state,

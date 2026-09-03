@@ -21,8 +21,8 @@ from forexmind.training.networks import (
     LOG_STD_MAX,
     LOG_STD_MIN,
     GaussianPolicy,
-    TanhGaussianPolicy,
     SquashedGaussianActor,
+    TanhGaussianPolicy,
 )
 
 

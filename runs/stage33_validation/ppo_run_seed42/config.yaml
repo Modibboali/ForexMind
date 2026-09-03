@@ -1,0 +1,78 @@
+algorithm:
+  name: ppo
+model:
+  hidden_dim: 16
+  num_layers: 2
+  activation: relu
+training:
+  total_env_steps: 128
+  batch_size: 32
+  replay_capacity: 10000
+  warmup_steps: 200
+  gradient_updates_per_step: 1
+  collect_batch: 64
+  gamma: 0.99
+  tau: 0.005
+  learning_rate: 0.003
+  alpha: 1.0
+  target_entropy: null
+  ppo_epochs: 10
+  ppo_clip_epsilon: 0.2
+  ppo_entropy_coef: 0.01
+  ppo_value_coef: 0.5
+  gae_lambda: 0.95
+  actor_lr: null
+  critic_lr: null
+  max_grad_norm: 0.5
+  log_std_min: -5.0
+  log_std_max: 2.0
+  adv_epsilon: 1.0e-08
+  finite_check: false
+  ppo_target_kl: 0.02
+  policy_sync_interval: 200
+environment:
+  split: train
+  context_length: 8
+  horizon: 16
+  initial_balance: '10000'
+  leverage: 50.0
+  spread: 0.0002
+  commission: 0.0
+  sizing_mode: equity_fraction
+  instruments:
+  - EURUSD
+  account_currency: USD
+  instrument_spreads:
+    EURUSD: 0.0002
+    GBPUSD: 0.0002
+    USDJPY: 0.02
+    USDCHF: 0.0002
+    AUDUSD: 0.0002
+    USDCAD: 0.0002
+    NZDUSD: 0.0002
+  min_reward: -50.0
+  max_reward: null
+compute:
+  num_workers: 1
+  learner_device: cpu
+  torch_threads: 1
+  torch_interop_threads: null
+  collect_backend: sync
+  dataset_backend: auto
+  memory_limit_fraction: null
+  seed: 42
+logging:
+  log_every_env_steps: 500
+  evaluate_every_env_steps: 1000
+  checkpoint_every_env_steps: 1000
+  run_dir: runs_smoke
+evaluation:
+  validation_episodes: 2
+  test_episodes: 2
+  eval_horizon: 16
+  eval_seed: 42
+selection:
+  metric: sharpe_drawdown
+  lambda_drawdown: 1.0
+run_id: ''
+dataset_version: processed-parquet-2026

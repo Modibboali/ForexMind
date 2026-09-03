@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import numpy as np
@@ -32,6 +32,7 @@ from forexmind.episodes.config import EpisodeConfig
 from forexmind.episodes.sampler import EpisodeSampler
 from forexmind.observation.encoder import EncoderConfig, ObservationEncoder
 from forexmind.observation.window import MarketWindowBuilder, WindowConfig
+from forexmind.training.networks import TanhGaussianPolicy
 from forexmind.training.policies import build_policy_network, sample_action
 
 
@@ -46,8 +47,12 @@ class Transition:
     log_prob: float = 0.0
     value: float = 0.0
     next_value: float = 0.0
+    next_bootstrap: bool | None = None
     worker_id: int = -1
     worker_pid: int = 0
+    trajectory_id: int = -1
+    trajectory_step: int = -1
+    rollout_fragment_id: int = -1
     # Diagnostic-only provenance for the first-non-finite audit.
     instrument: str = ""
     timestamp: object | None = None
@@ -104,6 +109,7 @@ class EnvWorker:
         self._builders: dict[str, MarketWindowBuilder] = {}
         self._active: tuple[ForexEnvironment, MarketWindowBuilder, object, np.ndarray] | None = None
         self._episode_index = 0
+        self._trajectory_step = 0
 
     # -- policy ---------------------------------------------------------------
 
@@ -147,6 +153,7 @@ class EnvWorker:
         window = builder.build(env.current_obs_index)
         last_obs = self.encoder.encode(obs, window).encoded
         self._active = (env, builder, spec, last_obs)
+        self._trajectory_step = 0
 
     # -- stepping -------------------------------------------------------------
 
@@ -174,11 +181,9 @@ class EnvWorker:
                 )
                 obs_t = torch.as_tensor(last_obs, dtype=torch.float32).unsqueeze(0)
                 if self.algorithm == "ppo":
-                    from forexmind.training.networks import TanhGaussianPolicy
-
-                    tanh_policy = policy
+                    tanh_policy = cast(TanhGaussianPolicy, policy)
                     # Sample action with Jacobian-corrected log-prob
-                    action, logp, raw = tanh_policy.log_prob_and_raw(obs_t, deterministic=False)
+                    _action, logp, raw = tanh_policy.log_prob_and_raw(obs_t, deterministic=False)
                     action_env = torch.tanh(raw)  # Guaranteed ∈ (-1, 1), no clamping needed
                     log_prob = float(logp.item())
                     value = float(value_net(obs_t).item()) if value_net is not None else 0.0
@@ -207,16 +212,21 @@ class EnvWorker:
             log_prob=log_prob,
             value=value,
             next_value=next_value,
+            next_bootstrap=not bool(terminated),
             worker_id=self.worker_id,
             worker_pid=os.getpid(),
+            trajectory_id=self._episode_index,
+            trajectory_step=self._trajectory_step,
             instrument=str(obs.instrument) if obs.instrument else "",
             timestamp=obs.timestamp,
             action_raw=action_raw_f,
         )
         self._active = (env, builder, _spec, next_obs)
         self._total_steps += 1
+        self._trajectory_step += 1
         if terminated or truncated:
             self._episode_index += 1
+            self._trajectory_step = 0
             self._active = None
         return t
 
@@ -230,12 +240,18 @@ class SyncCollector:
 
     def __init__(self, worker: EnvWorker) -> None:
         self.worker = worker
+        self._collect_round = 0
 
     def set_policy(self, policy: nn.Module | None, value_net: nn.Module | None = None) -> None:
         self.worker.set_policy(policy, value_net)
 
     def collect(self, n_steps: int, *, random_action: bool = False) -> list[Transition]:
-        return [self.worker.step(random_action=random_action) for _ in range(n_steps)]
+        fragment_id = self._collect_round
+        self._collect_round += 1
+        return [
+            replace(self.worker.step(random_action=random_action), rollout_fragment_id=fragment_id)
+            for _ in range(n_steps)
+        ]
 
     def close(self) -> None:
         pass
@@ -349,6 +365,7 @@ class ProcessCollector:
         self._q_in: list[Any] = []
         self._q_out: list[Any] = []
         self._procs: list[Any] = []
+        self._collect_round = 0
         base_cfg: dict[str, Any] = {
             "processed_dir": processed_dir,
             "split_config": split_config.to_dict(),
@@ -414,13 +431,19 @@ class ProcessCollector:
     def collect(self, n_steps: int, *, random_action: bool = False) -> list[Transition]:
         per = n_steps // self.num_workers
         rem = n_steps % self.num_workers
+        collect_round = self._collect_round
+        self._collect_round += 1
         for i, q in enumerate(self._q_in):
             q.put(("collect", per + (1 if i < rem else 0), random_action))
         transitions: list[Transition] = []
-        for q in self._q_out:
+        for worker_index, q in enumerate(self._q_out):
             batch = q.get()
             if batch is not None:
-                transitions.extend(batch)
+                fragment_id = collect_round * self.num_workers + worker_index
+                worker_batch = cast(list[Transition], batch)
+                transitions.extend(
+                    replace(t, rollout_fragment_id=fragment_id) for t in worker_batch
+                )
         return transitions
 
     def close(self) -> None:

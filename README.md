@@ -665,7 +665,7 @@ python -m forexmind.training.train_sac --config configs/sac_cpu.yaml --seeds 1 2
 python -m forexmind.training.train_ppo  --config configs/ppo_cpu.yaml  --seeds 1 2 3 4 5
 
 # Resume from a checkpoint
-python -m forexmind.training.train_sac --config configs/sac_cpu.yaml --resume runs/sac_cpu_seed42/checkpoints/latest.pt
+python -m forexmind.training.train_sac --config configs/sac_cpu.yaml --resume runs/sac_cpu_seed42/checkpoints/latest.txt
 
 # Evaluate a frozen checkpoint (validation or test)
 # --checkpoint accepts a .pt path, a run directory, or a run name (searched under --run-root)
@@ -692,7 +692,11 @@ Every run directory (e.g. `runs/sac_cpu_seed42/`) contains `checkpoints/` with:
 | `final.pt` | when a run completes |
 | `rescue_step_<env_steps>.pt` | on interruption (SIGINT/SIGTERM/exception) so the run can be resumed |
 
-`latest.txt` points at the most recent checkpoint, which is what `--resume` uses. The training launcher prints `Run directory` and the list of checkpoints at the end of each run, and `evaluate_checkpoint` prints a helpful list of existing checkpoints if you mistype a path.
+`latest.txt` points at the most recent checkpoint. Pass that marker, an exact `.pt`
+file, or the run directory to `--resume`; the legacy `latest.pt` spelling is also
+accepted as an alias. The training launcher prints `Run directory` and the list
+of checkpoints at the end of each run, and `evaluate_checkpoint` prints a helpful
+list of existing checkpoints if you mistype a path.
 
 ### Progress bar
 
@@ -729,6 +733,10 @@ tests/                     # Phase 3 tests (SAC, workers, data, eval, repro)
 
 - The replay buffer is **not** persisted in checkpoints (kept small); a resumed
   run starts with an empty buffer and refills it. Only buffer metadata is saved.
+- Resume restores learner parameters, optimizer state, counters, validation
+  history, and learner RNG state. Environment workers restart on fresh episodes,
+  so resume is a correct training continuation but not a bit-for-bit continuation
+  of in-flight worker episodes.
 - Checkpoints are written at `checkpoint_every_env_steps` plus `step_0` at
   start, `best` on validation improvement, `final` on completion, and a
   `rescue_step_*` on interruption. If a run is killed by the OS (e.g. Kaggle

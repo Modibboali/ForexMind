@@ -189,7 +189,7 @@ class PPOTrainer(BaseTrainer):
     ) -> tuple[torch.Tensor, torch.Tensor, float, float, float, torch.Tensor]:
         """Clipped PPO actor surrogate for one minibatch.
 
-        ``act_raw`` is the pre-tanh Gaussian sample ``u ~ N(μ, σ)``.
+        ``act_raw`` is the pre-tanh Gaussian sample ``u ~ N(mu, sigma)``.
         New log-prob is computed from the current policy with proper tanh
         Jacobian correction:
 
@@ -200,7 +200,7 @@ class PPOTrainer(BaseTrainer):
 
         * ``ratio = exp(new_log_prob - old_log_prob)`` (PPO importance ratio)
         * ``approx_kl = E[0.5 (ratio - 1)²]`` (KL divergence estimate)
-        * ``approx_kl_log = E[ratio - 1 - log(ratio)]`` (log-space KL estimate for target-KL early stopping)
+        * ``approx_kl_log = E[ratio - 1 - log(ratio)]`` (log-space KL for target KL)
         """
         # Compute log-prob at raw action using current policy (with Jacobian correction)
         new_logp, entropy = self.actor.evaluate(obs, act_raw)
@@ -225,22 +225,48 @@ class PPOTrainer(BaseTrainer):
         done: np.ndarray,
         val: np.ndarray,
         next_val: np.ndarray,
+        *,
+        bootstrap_mask: np.ndarray | None = None,
+        segment_ids: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Raw GAE recurrence (pre-normalization), exposed for hand-computed tests.
 
-        ``done`` marks *terminated* episodes only; truncated (horizon-limit)
-        episodes bootstrap with ``V(s')`` (``done[i]=False``), which is the
-        correct handling for time-limit truncation.
+        ``done`` marks *terminated* episodes only.  Truncated time-limit
+        transitions bootstrap by default, but the recurrence never carries
+        across a changed ``segment_id``.  PPO passes one segment per
+        worker/trajectory fragment so advantages cannot cross workers,
+        episodes, or collection-round boundaries.
         """
         n = len(rew)
         gamma = self.config.training.gamma
         lam = self.config.training.gae_lambda
+        if bootstrap_mask is None:
+            bootstrap_mask = ~np.asarray(done, dtype=bool)
+        else:
+            bootstrap_mask = np.asarray(bootstrap_mask, dtype=bool)
+        if segment_ids is None:
+            segment_ids = np.zeros(n, dtype=np.int64)
+        else:
+            segment_ids = np.asarray(segment_ids)
+        same_length = (
+            len(done)
+            == len(val)
+            == len(next_val)
+            == len(bootstrap_mask)
+            == len(segment_ids)
+            == n
+        )
+        if not same_length:
+            raise ValueError("GAE inputs must have identical length")
         adv = np.zeros(n, dtype=np.float32)
         last = 0.0
         for i in range(n - 1, -1, -1):
-            v_next = 0.0 if done[i] else float(next_val[i])
+            mask = bool(bootstrap_mask[i])
+            v_next = float(next_val[i]) if mask else 0.0
             delta = float(rew[i]) + gamma * v_next - float(val[i])
-            last = delta + gamma * lam * (0.0 if done[i] else 1.0) * last
+            carries_within_segment = i + 1 < n and segment_ids[i + 1] == segment_ids[i]
+            carry = mask and carries_within_segment
+            last = delta + gamma * lam * (1.0 if carry else 0.0) * last
             adv[i] = last
         returns = (adv + np.asarray(val, dtype=np.float32)).astype(np.float32)
         return adv.astype(np.float32), returns
@@ -251,9 +277,19 @@ class PPOTrainer(BaseTrainer):
         done: np.ndarray,
         val: np.ndarray,
         next_val: np.ndarray,
+        *,
+        bootstrap_mask: np.ndarray | None = None,
+        segment_ids: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Generalized advantage estimation with finite-std normalization."""
-        adv, returns = self._compute_gae(rew, done, val, next_val)
+        adv, returns = self._compute_gae(
+            rew,
+            done,
+            val,
+            next_val,
+            bootstrap_mask=bootstrap_mask,
+            segment_ids=segment_ids,
+        )
         # Advantage normalization A = (A - mu) / (sigma + eps).
         std = float(adv.std())
         if np.isfinite(std) and std > self._adv_epsilon:
@@ -263,6 +299,115 @@ class PPOTrainer(BaseTrainer):
             adv = np.zeros_like(adv)
         # If std is non-finite the caller's finite check reports it.
         return adv.astype(np.float32), returns
+
+    def _rollout_segment_key(self, t: Transition) -> tuple[int, int, int]:
+        return (int(t.rollout_fragment_id), int(t.worker_id), int(t.trajectory_id))
+
+    def _validate_rollout_integrity(
+        self,
+        rollout: list[Transition],
+        *,
+        advantages: np.ndarray | None = None,
+        returns: np.ndarray | None = None,
+    ) -> dict[str, float]:
+        if not rollout:
+            return {}
+        groups: dict[tuple[int, int, int], list[tuple[int, Transition]]] = {}
+        for i, t in enumerate(rollout):
+            if int(t.worker_id) < 0:
+                raise ValueError(f"rollout transition {i} has invalid worker_id={t.worker_id}")
+            if int(t.trajectory_id) < 0:
+                raise ValueError(
+                    f"rollout transition {i} has invalid trajectory_id={t.trajectory_id}"
+                )
+            if int(t.trajectory_step) < 0:
+                raise ValueError(
+                    f"rollout transition {i} has invalid trajectory_step={t.trajectory_step}"
+                )
+            if int(t.rollout_fragment_id) < 0:
+                raise ValueError(
+                    "rollout transition "
+                    f"{i} has invalid rollout_fragment_id={t.rollout_fragment_id}"
+                )
+            groups.setdefault(self._rollout_segment_key(t), []).append((i, t))
+
+        sizes: list[int] = []
+        for key, items in groups.items():
+            ordered = sorted(items, key=lambda item: int(item[1].trajectory_step))
+            steps = [int(t.trajectory_step) for _, t in ordered]
+            if len(set(steps)) != len(steps):
+                raise ValueError(f"duplicate trajectory_step in rollout segment {key}: {steps}")
+            expected = list(range(steps[0], steps[0] + len(steps)))
+            if steps != expected:
+                raise ValueError(
+                    f"missing or corrupt trajectory_step in rollout segment {key}: "
+                    f"got {steps}, expected {expected}"
+                )
+            for _, t in ordered:
+                if self._rollout_segment_key(t) != key:
+                    raise ValueError("GAE segment crosses a worker/trajectory boundary")
+            sizes.append(len(items))
+
+        if advantages is not None:
+            self._check_first_nonfinite("advantages", advantages, dim=None)
+        if returns is not None:
+            self._check_first_nonfinite("returns", returns, dim=None)
+
+        completed = sum(1 for t in rollout if t.terminated or t.truncated)
+        return {
+            "unique_trajectories": float(len(groups)),
+            "rollout_completed_episodes": float(completed),
+            "worker_trajectory_size_min": float(min(sizes)),
+            "worker_trajectory_size_max": float(max(sizes)),
+            "worker_trajectory_size_mean": float(np.mean(sizes)),
+        }
+
+    def _gae_for_rollout(
+        self, rollout: list[Transition]
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+        n = len(rollout)
+        raw_adv = np.zeros(n, dtype=np.float32)
+        returns = np.zeros(n, dtype=np.float32)
+        groups: dict[tuple[int, int, int], list[tuple[int, Transition]]] = {}
+        for i, t in enumerate(rollout):
+            groups.setdefault(self._rollout_segment_key(t), []).append((i, t))
+
+        for key, items in groups.items():
+            ordered = sorted(items, key=lambda item: int(item[1].trajectory_step))
+            idx = [i for i, _ in ordered]
+            seg = [t for _, t in ordered]
+            rew = np.asarray([t.reward for t in seg], dtype=np.float32)
+            done = np.asarray([t.terminated for t in seg], dtype=bool)
+            val = np.asarray([t.value for t in seg], dtype=np.float32)
+            next_val = np.asarray([t.next_value for t in seg], dtype=np.float32)
+            bootstrap = np.asarray(
+                [
+                    (not t.terminated) if t.next_bootstrap is None else bool(t.next_bootstrap)
+                    for t in seg
+                ],
+                dtype=bool,
+            )
+            segment_ids = np.full(len(seg), hash(key), dtype=np.int64)
+            adv_seg, ret_seg = self._compute_gae(
+                rew,
+                done,
+                val,
+                next_val,
+                bootstrap_mask=bootstrap,
+                segment_ids=segment_ids,
+            )
+            raw_adv[idx] = adv_seg
+            returns[idx] = ret_seg
+
+        std = float(raw_adv.std())
+        if np.isfinite(std) and std > self._adv_epsilon:
+            adv = (raw_adv - raw_adv.mean()) / (std + self._adv_epsilon)
+        elif np.isfinite(std):
+            adv = np.zeros_like(raw_adv)
+        else:
+            adv = raw_adv
+        integrity = self._validate_rollout_integrity(rollout, advantages=adv, returns=returns)
+        return adv.astype(np.float32), returns.astype(np.float32), integrity
 
     # -- PPO update -----------------------------------------------------------
 
@@ -276,7 +421,6 @@ class PPOTrainer(BaseTrainer):
         act = np.asarray([t.action for t in rollout], dtype=np.float32).reshape(-1, 1)
         act_raw = np.asarray([t.action_raw for t in rollout], dtype=np.float32).reshape(-1, 1)
         rew = np.asarray([t.reward for t in rollout], dtype=np.float32)
-        done = np.asarray([t.terminated for t in rollout], dtype=bool)
         old_logp = np.asarray([t.log_prob for t in rollout], dtype=np.float32).reshape(-1, 1)
         val = np.asarray([t.value for t in rollout], dtype=np.float32)
         next_val = np.asarray([t.next_value for t in rollout], dtype=np.float32)
@@ -292,7 +436,7 @@ class PPOTrainer(BaseTrainer):
         self._check_first_nonfinite("old_log_prob", old_logp, dim=1)
 
         rew_stats = tensor_stats(rew)
-        adv, returns = self._gae(rew, done, val, next_val)
+        adv, returns, integrity = self._gae_for_rollout(rollout)
         self._check_first_nonfinite("returns", returns, dim=None)
         self._check_first_nonfinite("normalized_advantages", adv, dim=None)
         ret_stats = tensor_stats(returns)
@@ -450,7 +594,11 @@ class PPOTrainer(BaseTrainer):
             "reward_std": rew_stats.get("std") or 0.0,
             "return_min": ret_stats.get("min") or 0.0,
             "return_max": ret_stats.get("max") or 0.0,
+            "rollout_transitions": float(n),
+            "advantage_mean": adv_stats.get("mean") or 0.0,
             "advantage_std": adv_stats.get("std") or 0.0,
+            "advantage_min": adv_stats.get("min") or 0.0,
+            "advantage_max": adv_stats.get("max") or 0.0,
             "mean_action": mean_action,
             "std_action": std_action,
             "mean_abs_action": mean_abs_action,
@@ -462,6 +610,7 @@ class PPOTrainer(BaseTrainer):
             "q1": float(np.mean(val)),
             "q2": 0.0,
         }
+        diag.update(integrity)
         self._last_diag = diag
         return diag
 
@@ -500,3 +649,10 @@ class PPOTrainer(BaseTrainer):
             self.actor_opt.load_state_dict(opts["actor_opt"])
         if opts.get("value_opt"):
             self.value_opt.load_state_dict(opts["value_opt"])
+
+    def _local_rng_state(self) -> dict[str, Any]:
+        return {"ppo_minibatch_rng": self._rng.bit_generator.state}
+
+    def _load_local_rng_state(self, state: dict[str, Any]) -> None:
+        if state.get("ppo_minibatch_rng"):
+            self._rng.bit_generator.state = state["ppo_minibatch_rng"]

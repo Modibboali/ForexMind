@@ -1,0 +1,17 @@
+{
+  "status": "already_complete",
+  "algorithm": "ppo",
+  "env_steps": 128,
+  "gradient_updates": 2,
+  "episodes": 8,
+  "best_checkpoint": "best",
+  "best_validation_score": -Infinity,
+  "wall_seconds": 0.0,
+  "steps_per_second": 0.0,
+  "workers_configured": 1,
+  "workers_alive_at_finalize": 0,
+  "workers_producing_transitions": 0,
+  "dataset_backend": "mmap",
+  "warnings": [],
+  "message": "No training performed: checkpoint already meets/exceeds target."
+}

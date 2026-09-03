@@ -5,7 +5,7 @@ model:
   num_layers: 2
   activation: relu
 training:
-  total_env_steps: 200
+  total_env_steps: 128
   batch_size: 32
   replay_capacity: 10000
   warmup_steps: 200
@@ -53,7 +53,7 @@ environment:
   min_reward: -50.0
   max_reward: null
 compute:
-  num_workers: 2
+  num_workers: 4
   learner_device: cpu
   torch_threads: 1
   torch_interop_threads: null

@@ -104,7 +104,7 @@ class TanhGaussianPolicy(nn.Module):
 
     **Mathematically correct bounded continuous policy:**
 
-    1. Sample raw: ``u ~ N(μ, σ)`` where ``(μ, σ) = policy_net(obs)``
+    1. Sample raw: ``u ~ N(mean, stddev)`` from ``policy_net(obs)``
     2. Transform: ``a = tanh(u)`` where ``a ∈ (-1, 1)`` (strictly bounded)
     3. Log-prob with Jacobian: ``log π(a|s) = log N(u) - Σ log(1 - tanh²(u) + ε)``
 
@@ -141,7 +141,7 @@ class TanhGaussianPolicy(nn.Module):
         self.log_std = nn.Parameter(torch.zeros(action_dim))
 
     def forward(self, obs: torch.Tensor) -> torch.distributions.Normal:
-        """Return the base Normal distribution N(μ, σ) over the raw (pre-tanh) action."""
+        """Return the base Normal distribution over the raw (pre-tanh) action."""
         return self.dist(obs)
 
     def dist(self, obs: torch.Tensor) -> torch.distributions.Normal:
@@ -169,7 +169,7 @@ class TanhGaussianPolicy(nn.Module):
             (action, log_prob, raw_action) where:
             - action: tanh-transformed action ∈ (-1, 1), ready for environment
             - log_prob: log π(a|s) = log N(u) - Σ log(1 - tanh²(u) + ε)
-            - raw_action: u ~ N(μ, σ), stored for replay/PPO updates
+            - raw_action: sample from N(mean, stddev), stored for replay/PPO updates
         """
         dist = self.dist(obs)
         raw = dist.mean if deterministic else dist.rsample()
@@ -183,7 +183,9 @@ class TanhGaussianPolicy(nn.Module):
         log_prob = log_prob_raw - log_det_jacobian
         return action, log_prob.sum(-1, keepdim=True), raw
 
-    def evaluate(self, obs: torch.Tensor, raw_action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def evaluate(
+        self, obs: torch.Tensor, raw_action: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Evaluate log-prob at a given raw action (for PPO updates).
 
         During PPO training, we must evaluate log π(a|s) using the raw action ``u``

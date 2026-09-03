@@ -5,7 +5,7 @@ Usage::
     python -m forexmind.training.train_sac --config configs/sac_cpu.yaml --seeds 1 2 3
     python -m forexmind.training.train_sac --seeds 1 2 3 --workers 32
     python -m forexmind.training.train_sac --config configs/sac_cpu.yaml \
-        --resume runs/sac_cpu_seed42/checkpoints/latest.pt
+        --resume runs/sac_cpu_seed42/checkpoints/latest.txt
 """
 
 from __future__ import annotations

@@ -326,3 +326,18 @@ def test_resolve_checkpoint_no_runs_clear_hint(tmp_path) -> None:
     with pytest.raises(FileNotFoundError) as exc:
         resolve_checkpoint("sac_cpu_seed42", run_root=tmp_path)
     assert "Train first" in str(exc.value)
+
+
+def test_resume_checkpoint_resolves_marker_and_latest_alias(tmp_path) -> None:
+    from forexmind.training.checkpoint import resolve_resume_checkpoint
+
+    checkpoint_dir = tmp_path / "run" / "checkpoints"
+    checkpoint_dir.mkdir(parents=True)
+    checkpoint = checkpoint_dir / "step_100.pt"
+    checkpoint.write_bytes(b"x")
+    marker = checkpoint_dir / "latest.txt"
+    marker.write_text("step_100.pt\n", encoding="utf-8")
+
+    assert resolve_resume_checkpoint(marker) == checkpoint
+    assert resolve_resume_checkpoint(checkpoint_dir / "latest.pt") == checkpoint
+    assert resolve_resume_checkpoint(tmp_path / "run") == checkpoint

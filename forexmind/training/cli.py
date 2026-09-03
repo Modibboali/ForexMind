@@ -12,6 +12,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+from forexmind.training.checkpoint import resolve_resume_checkpoint
 from forexmind.training.config import ExperimentConfig
 from forexmind.training.ppo import PPOTrainer
 from forexmind.training.sac import SACTrainer
@@ -87,12 +88,17 @@ def load_config(args: argparse.Namespace, algorithm: str) -> ExperimentConfig:
         cfg = replace(cfg, training=replace(cfg.training, total_env_steps=cap))
     if args.backend:
         cfg = replace(cfg, compute=replace(cfg.compute, collect_backend=args.backend))
+    if args.run_id:
+        cfg = replace(cfg, run_id=args.run_id)
     return cfg
 
 
 def run_dir_for(config: ExperimentConfig, seed: int, run_root: str | None = None) -> Path:
     root = Path(run_root) if run_root else Path(config.logging.run_dir)
     label = config.run_id or "run"
+    prefix = f"{config.algorithm.name}_"
+    if label.startswith(prefix):
+        label = label[len(prefix) :]
     return root / f"{config.algorithm.name}_{label}_seed{seed}"
 
 
@@ -104,6 +110,7 @@ def train_one(
     run_root: str | None = None,
 ) -> dict[str, object]:
     """Run one training and persist its summary as ``training_summary.json``."""
+    resume_path = resolve_resume_checkpoint(resume) if resume is not None else None
     cfg = replace(config, compute=replace(config.compute, seed=seed))
     run_dir = run_dir_for(cfg, seed, run_root)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +118,7 @@ def train_one(
 
     trainer_cls = TRAINER_REGISTRY[cfg.algorithm.name]
     trainer = trainer_cls(cfg, run_dir)
-    summary = trainer.train(resume=resume)
+    summary = trainer.train(resume=resume_path)
     (run_dir / "training_summary.json").write_text(
         json.dumps(summary, indent=2, default=str), encoding="utf-8"
     )
@@ -123,6 +130,10 @@ def train_one(
 
 
 def run_multiseed(args: argparse.Namespace, algorithm: str) -> list[dict[str, object]]:
+    if args.algorithm != algorithm:
+        raise ValueError(
+            f"--algorithm={args.algorithm!r} does not match the {algorithm!r} launcher"
+        )
     config = load_config(args, algorithm)
     seeds = args.seeds if args.seeds else [config.compute.seed]
     summaries: list[dict[str, object]] = []
