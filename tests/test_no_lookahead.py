@@ -73,7 +73,7 @@ def test_cannot_execute_at_observed_close_after_jump_up() -> None:
     # The observed M5[0] close is 1.1000.
     assert float(obs.market_window[-1].close) == 1.1000
 
-    obs, reward, _terminated, _truncated, info = env.step(4)  # full long
+    obs, reward, _terminated, _truncated, info = env.step(9)  # full long
     # Execution must occur at the NEXT M1 open (1.1100), not the observed close.
     assert info["execution_price"] == Decimal("1.1100")
     # Marked at M5[1] close (1.1100): no unrealised profit from the jump.
@@ -85,7 +85,7 @@ def test_cannot_execute_at_observed_close_after_jump_up() -> None:
 def test_cannot_execute_at_observed_close_after_jump_down() -> None:
     env = _env(JUMP_DOWN_M1)
     obs, _ = env.reset(seed=0, start_index=0)
-    obs, reward, _terminated, _truncated, info = env.step(0)  # full short
+    obs, reward, _terminated, _truncated, info = env.step(2)  # full short
     # Execution at the NEXT M1 open (1.0900), not the observed close (1.1000).
     assert info["execution_price"] == Decimal("1.0900")
     assert obs.account.unrealized_pnl == Decimal("0")
@@ -96,7 +96,7 @@ def test_no_lookahead_general_sequence() -> None:
     """The agent's reward at step t depends only on data up to M5[t+1]."""
     env = _env(JUMP_UP_M1)
     env.reset(seed=0, start_index=0)
-    obs, reward, _term, _trunc, info = env.step(4)
+    obs, reward, _term, _trunc, info = env.step(9)
     # Reward only reflects equity marked at M5[1] close (the observation), and
     # execution at the next open -- never a price hidden inside the bar.
     assert info["timestamp"] == obs.timestamp

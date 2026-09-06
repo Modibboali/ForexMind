@@ -20,11 +20,12 @@ from decimal import Decimal
 
 import numpy as np
 import pandas as pd
+from gymnasium.spaces import Discrete
 
 from forexmind.config import EnvironmentConfig, _dec
 from forexmind.data.dataset import InstrumentData, MarketDataset
 from forexmind.data.schema import CLOSE, HIGH, LOW, OPEN, TIMESTAMP, MarketBar
-from forexmind.environment.actions import Action, resolve_action
+from forexmind.environment.actions import Action, resolve_action, valid_action_mask
 from forexmind.environment.costs import ExecutionCostModel
 from forexmind.environment.execution import ExecutionEngine, ExecutionReport
 from forexmind.environment.financing import FinancingModel, ZeroCostFinancing
@@ -69,6 +70,7 @@ class ForexEnvironment:
         if len(self._dataset) == 0:
             raise EnvironmentError("dataset contains no instruments")
         self.config = config
+        self.action_space: Discrete = Discrete(10)
         self._default_instrument = instrument
         self._utc_offset_hours = utc_offset_hours
 
@@ -173,7 +175,9 @@ class ForexEnvironment:
 
     # ------------------------------------------------------------------ step
 
-    def step(self, action: int | float) -> tuple[Observation, float, bool, bool, dict[str, object]]:
+    def step(
+        self, action: Action | int | float
+    ) -> tuple[Observation, float, bool, bool, dict[str, object]]:
         """Apply ``action`` (discrete index or raw target exposure).
 
         Returns ``(obs, reward, terminated, truncated, info)``.
@@ -209,13 +213,21 @@ class ForexEnvironment:
         exec_mid = _dec(float(self._m1.iloc[exec_idx][OPEN]))
         exec_ts = pd.Timestamp(self._m1.iloc[exec_idx][TIMESTAMP])
         current_units = self._portfolio.position.units
-        target_units = self._target_units(act, exec_mid)
-        delta = target_units - current_units
-
-        report = self._engine.execute(exec_ts, exec_mid, delta, instrument=self._instrument)
-        trade = self._portfolio.adjust_to_target(
-            target_units, report.execution_price, report.commission
+        decision_equity = self._portfolio.equity
+        # HOLD bypasses sizing, execution, and portfolio adjustment entirely.
+        target_units = (
+            current_units
+            if act.is_hold
+            else (Decimal(0) if act.target_exposure == 0.0 else self._target_units(act, exec_mid))
         )
+        delta = target_units - current_units
+        report = None
+        trade = None
+        if delta != 0:
+            report = self._engine.execute(exec_ts, exec_mid, delta, instrument=self._instrument)
+            trade = self._portfolio.adjust_to_target(
+                target_units, report.execution_price, report.commission
+            )
 
         # Mark to market at the next observation's close.
         next_idx = i + 1
@@ -225,13 +237,16 @@ class ForexEnvironment:
 
         terminated = False
         liquidation = False
+        forced = False
         # Deterministic liquidation check (all amounts in account currency).
+        exposure_before_forced_close = self._portfolio.snapshot().gross_exposure
         snap = self._margin.snapshot(
             equity=self._portfolio.equity,
             gross_exposure=self._portfolio.snapshot().gross_exposure,
         )
         if snap.liquidation:
             liquidation = True
+            forced = not self._portfolio.position.is_flat
             self._liquidate(snap)
             terminated = True
 
@@ -243,6 +258,7 @@ class ForexEnvironment:
             if steps_taken >= self._horizon_steps:
                 truncated = True
                 if self.config.close_at_episode_end and not self._portfolio.position.is_flat:
+                    forced = True
                     self._close_at_current_mid()
 
         reward = self._reward.reward(self._prev_equity, self._portfolio.equity)
@@ -260,10 +276,37 @@ class ForexEnvironment:
             execution=report,
             liquidation=liquidation,
         )
+        factor = self._portfolio.converter.quote_to_account_factor(
+            self._instrument or "", exec_mid, self.config.account_currency
+        )
+
+        info["action_diagnostics"] = {
+            "units_before": float(current_units),
+            "units_after_policy": float(target_units),
+            "units_after_step": float(self._portfolio.position.units),
+            "position_changes": int(delta != 0),
+            "actual_executions": int(report is not None),
+            "sign_reversals": int(current_units * target_units < 0),
+            "turnover": float(abs(delta) * exec_mid * factor / decision_equity)
+            if decision_equity > 0
+            else 0.0,
+            "forced_executions": int(forced),
+            "forced_turnover": float(exposure_before_forced_close / decision_equity)
+            if forced and decision_equity > 0
+            else 0.0,
+        }
         self._last_info = info
         return obs, reward, terminated, truncated, info
 
     # ------------------------------------------------------------- properties
+
+    def action_masks(self) -> np.ndarray:
+        if self._portfolio is None:
+            raise EnvironmentError("environment not reset")
+        snap = self._portfolio.snapshot()
+        units = snap.position.units
+        exposure = float(snap.gross_exposure / snap.equity) if snap.equity > 0 else 0.0
+        return valid_action_mask(-exposure if units < 0 else exposure, is_flat=units == 0)
 
     @property
     def instrument(self) -> str | None:
@@ -356,6 +399,7 @@ class ForexEnvironment:
     def _target_units(self, action: Action, exec_mid: Decimal) -> Decimal:
         assert self._portfolio is not None
         sizing = self.config.sizing
+        assert action.target_exposure is not None
         exposure = _dec(action.target_exposure)
         if sizing.mode == "fixed_units":
             return exposure * sizing.fixed_units
@@ -559,6 +603,8 @@ class ForexEnvironment:
             "leverage_used": margin.leverage_used,
             "drawdown": snap.drawdown,
             "trade_cost": Decimal(0),
+            "units_delta": Decimal(0),
+            "execution_commission": Decimal(0),
             "execution_price": None,
             "reward": reward,
             "terminated": terminated,

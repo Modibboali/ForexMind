@@ -54,7 +54,7 @@ class TrainingConfig:
     actor_lr: float | None = None  # None -> learning_rate
     critic_lr: float | None = None  # None -> learning_rate
     max_grad_norm: float = 0.5  # 0.0 disables gradient clipping
-    log_std_min: float = -5.0  # bounds for the PPO Gaussian log-std
+    log_std_min: float = -5.0  # legacy continuous-checkpoint metadata; unused by categorical PPO
     log_std_max: float = 2.0
     adv_epsilon: float = 1e-8  # advantage-normalization denominator floor
     finite_check: bool = False  # raise FiniteError at the first non-finite value

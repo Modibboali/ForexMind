@@ -135,10 +135,14 @@ class PolicyEvaluator:
         # Trading-style diagnostics from pooled trajectories.
         metrics["turnover"] = _pooled_turnover(ev)
         metrics["mean_reward"] = _pooled_mean_reward(ev)
+        if algorithm == "ppo":
+            metrics.update(_action_diagnostics([t for ts in grouped.values() for t in ts]))
 
         per_instrument: dict[str, dict[str, object]] = {}
         for instr, series in per_instrument_series.items():
             per_instrument[instr] = compute_series_metrics(series, periods_per_year)
+            if algorithm == "ppo":
+                per_instrument[instr].update(_action_diagnostics(grouped[instr]))
 
         return PolicyEvaluation(
             split=split,
@@ -177,3 +181,17 @@ def _pooled_mean_reward(ev: AgentEvaluation) -> float:
         for r in t.rewards
     ]
     return float(np.mean(rewards)) if rewards else 0.0
+
+
+def _action_diagnostics(trajectories: list) -> dict[str, float]:
+    from forexmind.training.action_diagnostics import ActionDiagnostics
+
+    diagnostics = ActionDiagnostics()
+    for episode, trajectory in enumerate(trajectories):
+        indices = trajectory.info["action_indices"]
+        infos = trajectory.info["action_diagnostics"]
+        for step, (action, info) in enumerate(zip(indices, infos, strict=True)):
+            diagnostics.record(
+                action, info, episode=episode, step=step, done=step == len(indices) - 1
+            )
+    return diagnostics.summary()

@@ -32,14 +32,14 @@ from forexmind.episodes.config import EpisodeConfig
 from forexmind.episodes.sampler import EpisodeSampler
 from forexmind.observation.encoder import EncoderConfig, ObservationEncoder
 from forexmind.observation.window import MarketWindowBuilder, WindowConfig
-from forexmind.training.networks import TanhGaussianPolicy
+from forexmind.training.networks import CategoricalPolicy
 from forexmind.training.policies import build_policy_network, sample_action
 
 
 @dataclass(frozen=True, slots=True)
 class Transition:
     obs: np.ndarray
-    action: float
+    action: int | float
     reward: float
     next_obs: np.ndarray
     terminated: bool
@@ -56,11 +56,8 @@ class Transition:
     # Diagnostic-only provenance for the first-non-finite audit.
     instrument: str = ""
     timestamp: object | None = None
-    # For PPO: the raw pre-clamp Gaussian sample ``u ~ N(mean, std)``.  The
-    # importance ratio must use the density at THIS value (the actual sample
-    # of the policy's Gaussian); ``action`` remains the env-facing clamped
-    # projection.  ``action_raw == action`` when the sample was not clamped.
-    action_raw: float = 0.0
+    action_mask: np.ndarray | None = None
+    trading_info: dict[str, Any] | None = None
 
 
 def worker_episode_seed(global_seed: int, worker_id: int, episode_index: int) -> int:
@@ -157,6 +154,7 @@ class EnvWorker:
 
     # -- stepping -------------------------------------------------------------
 
+    @torch.no_grad()
     def step(self, *, random_action: bool = False) -> Transition:
         if self._active is None:
             self._start_episode()
@@ -171,7 +169,7 @@ class EnvWorker:
         log_prob = 0.0
         value = 0.0
         action_f = 0.0
-        action_raw_f = 0.0
+        action_mask = env.action_masks() if self.algorithm == "ppo" else None
         if use_policy and policy is not None:
             # Isolate this worker's policy sampling RNG so the learner's RNG is
             # untouched and the worker is deterministic in the sync backend.
@@ -181,19 +179,22 @@ class EnvWorker:
                 )
                 obs_t = torch.as_tensor(last_obs, dtype=torch.float32).unsqueeze(0)
                 if self.algorithm == "ppo":
-                    tanh_policy = cast(TanhGaussianPolicy, policy)
-                    # Sample action with Jacobian-corrected log-prob
-                    _action, logp, raw = tanh_policy.log_prob_and_raw(obs_t, deterministic=False)
-                    action_env = torch.tanh(raw)  # Guaranteed ∈ (-1, 1), no clamping needed
+                    mask_t = torch.as_tensor(action_mask, dtype=torch.bool).unsqueeze(0)
+                    action_env, logp = cast(CategoricalPolicy, policy).sample(obs_t, mask_t)
                     log_prob = float(logp.item())
                     value = float(value_net(obs_t).item()) if value_net is not None else 0.0
-                    action_f = float(action_env.item())
-                    action_raw_f = float(raw.item())
+                    action_f = int(action_env.item())
                 else:
                     action_f = float(sample_action(policy, last_obs, self.algorithm))
         else:
-            action_f = float(self._rng.uniform(-1.0, 1.0))
+            if action_mask is not None:
+                action_f = int(self._rng.choice(np.flatnonzero(action_mask)))
+                log_prob = -float(np.log(action_mask.sum()))
+            else:
+                action_f = float(self._rng.uniform(-1.0, 1.0))
 
+        if action_mask is not None and not action_mask[int(action_f)]:
+            raise RuntimeError("invalid categorical action sampled")
         obs, reward, terminated, truncated, _info = env.step(action_f)
         window = builder.build(env.current_obs_index)
         next_obs = self.encoder.encode(obs, window).encoded
@@ -219,7 +220,8 @@ class EnvWorker:
             trajectory_step=self._trajectory_step,
             instrument=str(obs.instrument) if obs.instrument else "",
             timestamp=obs.timestamp,
-            action_raw=action_raw_f,
+            action_mask=action_mask,
+            trading_info=cast(dict[str, Any] | None, _info.get("action_diagnostics")),
         )
         self._active = (env, builder, _spec, next_obs)
         self._total_steps += 1
@@ -290,8 +292,6 @@ def _worker_process_main(cfg: dict[str, Any], q_in: Any, q_out: Any) -> None:  #
         cfg["obs_dim"],
         cfg["action_dim"],
         model,
-        log_std_min=cfg.get("log_std_min"),
-        log_std_max=cfg.get("log_std_max"),
     )
     policy.eval()
     value_net = None
@@ -356,8 +356,6 @@ class ProcessCollector:
         action_dim: int,
         global_seed: int,
         num_workers: int,
-        log_std_min: float = -5.0,
-        log_std_max: float = 2.0,
         dataset_backend: str = "auto",
     ) -> None:
         self.num_workers = max(1, num_workers)
@@ -380,8 +378,6 @@ class ProcessCollector:
             "obs_dim": obs_dim,
             "action_dim": action_dim,
             "global_seed": global_seed,
-            "log_std_min": log_std_min,
-            "log_std_max": log_std_max,
             "dataset_backend": dataset_backend,
         }
         for wid in range(self.num_workers):

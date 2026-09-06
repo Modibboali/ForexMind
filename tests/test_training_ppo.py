@@ -96,9 +96,9 @@ def test_reward_finite_floor_on_equity_collapse_end_to_end() -> None:
     ds.add(InstrumentData.from_m1("EURUSD", ladder_m1("2025-01-06 00:00", prices)))
     env = ForexEnvironment(ds, cfg)
     env.reset(seed=0, start_index=0)
-    _obs, _r0, t0, _tr0, _i0 = env.step(4)  # go long at 1.10
+    _obs, _r0, t0, _tr0, _i0 = env.step(9)  # go long at 1.10
     assert not t0
-    _obs, r1, t1, _tr1, info1 = env.step(4)  # crash -> liquidation
+    _obs, r1, t1, _tr1, info1 = env.step(9)  # crash -> liquidation
     assert t1 and info1["liquidation"] is True
     assert np.isfinite(r1)
     assert r1 == -50.0  # finite floor replaces -inf
@@ -286,12 +286,10 @@ def test_ppo_update_diagnostics_and_grad_clip(tmp_path) -> None:
         "return_min",
         "return_max",
         "advantage_std",
-        "mean_action",
-        "std_action",
-        "mean_abs_action",
-        "frac_near_minus_one",
-        "frac_near_zero",
-        "frac_near_plus_one",
+        "pct_hold",
+        "pct_flat",
+        "pct_long",
+        "pct_short",
     )
     for key in expected:
         assert key in diag, key
@@ -330,28 +328,17 @@ def test_gaussian_policy_log_std_bounds() -> None:
 
 
 def test_ppo_worker_logprob_consistent_with_trainer(tmp_path) -> None:
-    """Stored old_log_prob must match tanh-Jacobian-corrected log-prob at raw action u.
-
-    With tanh-squashed Gaussian:
-    log π(a|s) = log N(u) - log(1 - tanh²(u) + ε)
-    """
+    """Worker probabilities reconstruct exactly from the integer and saved mask."""
     trainer = _trainer(tmp_path)
     trainer._sync_policy_to_workers()
     t = trainer.collector.worker.step(random_action=False)
-    obs_t = torch.as_tensor(t.obs, dtype=torch.float32).unsqueeze(0)
-    raw_t = torch.as_tensor([[t.action_raw]], dtype=torch.float32)
-
-    # Evaluate log-prob using the policy (with Jacobian correction)
-    expected_logp, _ = trainer.actor.evaluate(obs_t, raw_t)
-
-    # The stored log-prob must match (with numerical tolerance)
-    assert abs(t.log_prob - float(expected_logp.item())) < 1e-5, \
-        f"Stored log-prob {t.log_prob} != expected {expected_logp.item()}"
-
-    # The env-facing action is the tanh-transformed value (naturally in (-1, 1))
-    assert -1.0 < t.action < 1.0, f"Action {t.action} not in (-1, 1)"
-    assert abs(t.action - float(torch.tanh(raw_t).item())) < 1e-6, \
-        f"Action {t.action} != tanh(raw) {torch.tanh(raw_t).item()}"
+    obs = torch.as_tensor(t.obs).unsqueeze(0)
+    action = torch.tensor([t.action], dtype=torch.long)
+    mask = torch.as_tensor(t.action_mask).unsqueeze(0)
+    logp, _ = trainer.actor.evaluate(obs, action, mask)
+    assert abs(t.log_prob - logp.item()) < 1e-6
+    assert isinstance(t.action, int) and t.action_mask[t.action]
+    assert not hasattr(t, "action_raw")
 
 
 def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
@@ -367,7 +354,8 @@ def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
 
     # Create random obs and raw actions
     obs = torch.randn(4, trainer.obs_dim)
-    act_raw = torch.randn(4, 1)
+    action = torch.tensor([0, 2, 7, 9], dtype=torch.long)
+    mask = torch.ones(4, 10, dtype=torch.bool)
 
     # Create plausible old log-probs
     old_logp = torch.randn(4, 1)
@@ -377,7 +365,7 @@ def test_ppo_minibatch_math_hand_computed(tmp_path) -> None:
 
     # Call trainer's _minibatch_actor
     actor_loss, ratio, approx_kl, approx_kl_log, clip_frac, entropy = trainer._minibatch_actor(
-        obs, act_raw, old_logp, adv, eps=eps, ent_coef=ent_coef
+        obs, action, old_logp, adv, action_mask=mask, eps=eps, ent_coef=ent_coef
     )
 
     # Verify properties
@@ -419,8 +407,9 @@ def test_gaussian_policy_evaluate_matches_dist_logprob() -> None:
     # Expected: log N(u) - log(1 - tanh²(u) + ε)
     dist = policy.dist(obs)
     action_transformed = torch.tanh(raw)
-    expected_logp = dist.log_prob(raw).sum(-1, keepdim=True) - \
-                    torch.log(1.0 - action_transformed.pow(2) + 1e-6)
+    expected_logp = dist.log_prob(raw).sum(-1, keepdim=True) - torch.log(
+        1.0 - action_transformed.pow(2) + 1e-6
+    )
 
     # Actual: policy.evaluate()
     lp, _ = policy.evaluate(obs, raw)

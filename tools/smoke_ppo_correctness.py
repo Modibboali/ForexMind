@@ -3,8 +3,8 @@
 This tool runs a minimal PPO training run with strict correctness checks:
 - No NaN/Inf in any tensor
 - Finite actor/critic losses and gradients
-- Finite log-probabilities (tanh Jacobian correction applied correctly)
-- Actions remain bounded [-1, 1]
+- Finite masked categorical log-probabilities
+- Actions use integer indices 0 through 9
 - KL divergence reasonable
 - No pathological clipping (clip_fraction < 1)
 - Evaluation metrics internally consistent
@@ -126,8 +126,8 @@ def run_smoke_test(
         trainer = PPOTrainer(config, run_dir, dataset=dataset)
 
         print(f"[SMOKE] Trainer initialized: {run_dir}")
-        print("[SMOKE] Policy: tanh-squashed Gaussian")
-        print("[SMOKE] Action bounds: (-1, +1)")
+        print("[SMOKE] Policy: masked categorical")
+        print("[SMOKE] Action indices: 0 through 9")
         print()
 
         # Run actual training loop

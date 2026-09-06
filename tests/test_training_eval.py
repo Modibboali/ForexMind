@@ -215,8 +215,8 @@ def test_load_checkpoint_policy_roundtrip(tmp_path) -> None:
 
 
 def test_load_checkpoint_policy_roundtrip_ppo(tmp_path) -> None:
-    """A PPO checkpoint must load a GaussianPolicy (was a SAC actor -> bug)."""
-    from forexmind.training.networks import GaussianPolicy
+    """A PPO checkpoint must load a CategoricalPolicy (was a SAC actor -> bug)."""
+    from forexmind.training.networks import CategoricalPolicy
     from forexmind.training.ppo import PPOTrainer
 
     cfg = ExperimentConfig.smoke("ppo")
@@ -228,10 +228,15 @@ def test_load_checkpoint_policy_roundtrip_ppo(tmp_path) -> None:
         tmp_path / "checkpoints" / "x.pt", trainer.obs_dim, cfg.model
     )
     assert algorithm == "ppo"
-    assert isinstance(policy, GaussianPolicy)
+    assert isinstance(policy, CategoricalPolicy)
     # And it must actually be usable through the PPO action path.
-    action = sample_action(policy, np.zeros(trainer.obs_dim, dtype=np.float32), "ppo")
-    assert -1.0 <= action <= 1.0
+    action = sample_action(
+        policy,
+        np.zeros(trainer.obs_dim, dtype=np.float32),
+        "ppo",
+        action_mask=np.array([True, False] + [True] * 8),
+    )
+    assert isinstance(action, int) and 0 <= action < 10 and action != 1
     for p1, p2 in zip(trainer.actor.parameters(), policy.parameters(), strict=True):
         assert np.allclose(p1.detach().numpy(), p2.detach().numpy())
 

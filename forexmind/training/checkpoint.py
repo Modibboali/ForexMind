@@ -224,6 +224,9 @@ def build_checkpoint_state(
     """Assemble a serializable checkpoint dict."""
     return {
         "algorithm": algorithm,
+        "action_policy": "categorical_v1"
+        if algorithm == "ppo" and any(k.startswith("logits_net.") for k in policy_state)
+        else "continuous",
         "policy": policy_state,
         "critics": critic_states or {},
         "targets": target_states or {},

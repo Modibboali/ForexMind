@@ -1,33 +1,9 @@
-"""PPO trainer (Phase 3).
-
-On-policy proximal policy optimization with a Gaussian policy (clipped
-objective), a learned value baseline, GAE returns, and an entropy bonus.
-The collector performs full on-policy rollouts: each collection round the
-learner re-syncs its current policy/value to the workers, collects a batch,
-then runs several PPO epochs over that batch.
-
-Numerical stability (see docs/ppo_numerical_stability_audit.md):
-
-* the pipeline is instrumented to find the *first* non-finite tensor in a
-  documented order (obs -> reward -> value -> returns -> advantages -> actor
-  output -> log-prob -> ratio -> losses -> gradients -> parameters);
-* ``finite_check`` mode raises :class:`FiniteError` at the first non-finite
-  value (used for debugging and the 1M-step validation run);
-* rewards are validated and their min/max/mean/std/max-abs are logged;
-* GAE + advantage normalization guard against degenerate std and non-finite
-  inputs;
-* actor and critic gradients are clipped to ``max_grad_norm`` (0 disables);
-* ``actor_lr`` / ``critic_lr`` are independently configurable;
-* the stored worker log-prob and the trainer's new log-prob both use the
-  density of the RAW pre-clamp Gaussian sample ``u`` (the exact sampling
-  distribution), while the environment-facing action stays ``clamp(u)``;
-* ``ppo_target_kl`` stops the remaining PPO epochs for a rollout once the
-  KL estimate exceeds it (policy cannot run away inside a rollout)."""
+"""Masked categorical PPO; clipped objective and trajectory-isolated GAE."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -35,9 +11,10 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import Adam
 
+from forexmind.training.action_diagnostics import ActionDiagnostics
 from forexmind.training.collector import Transition
 from forexmind.training.config import ExperimentConfig
-from forexmind.training.networks import GaussianPolicy, ValueNet
+from forexmind.training.networks import CategoricalPolicy, ValueNet
 from forexmind.training.numerics import (
     assert_finite,
     grad_norm_stats,
@@ -64,13 +41,7 @@ class PPOTrainer(BaseTrainer):
     ) -> None:
         super().__init__(config, run_dir, dataset=dataset)
         model = config.model
-        self.actor = GaussianPolicy(
-            self.obs_dim,
-            self.action_dim,
-            model,
-            log_std_min=config.training.log_std_min,
-            log_std_max=config.training.log_std_max,
-        )
+        self.actor = CategoricalPolicy(self.obs_dim, model)
         self._value_net = ValueNet(self.obs_dim, model)
         self.actor.to(self.device)
         self._value_net.to(self.device)
@@ -89,6 +60,8 @@ class PPOTrainer(BaseTrainer):
         self._finite_alert_count = 0
         self._nonfinite_total = 0
         self._clip_warn_count = 0
+        self.action_diagnostics = ActionDiagnostics()
+        self.update_history: list[dict[str, float]] = []
 
     # -- BaseTrainer interface ------------------------------------------------
 
@@ -102,6 +75,16 @@ class PPOTrainer(BaseTrainer):
         return len(self._rollout)
 
     def _consume_transitions(self, transitions: list[Transition]) -> None:
+        for t in transitions:
+            if t.trading_info is not None:
+                self.action_diagnostics.record(
+                    int(t.action),
+                    t.trading_info,
+                    worker=t.worker_id,
+                    episode=t.trajectory_id,
+                    step=t.trajectory_step,
+                    done=t.terminated or t.truncated,
+                )
         self._rollout.extend(transitions)
         if len(self._rollout) < self.config.training.collect_batch:
             return
@@ -180,30 +163,16 @@ class PPOTrainer(BaseTrainer):
     def _minibatch_actor(
         self,
         obs: torch.Tensor,
-        act_raw: torch.Tensor,
+        action: torch.Tensor,
         old_logp: torch.Tensor,
         adv: torch.Tensor,
         *,
+        action_mask: torch.Tensor,
         eps: float,
         ent_coef: float,
     ) -> tuple[torch.Tensor, torch.Tensor, float, float, float, torch.Tensor]:
-        """Clipped PPO actor surrogate for one minibatch.
-
-        ``act_raw`` is the pre-tanh Gaussian sample ``u ~ N(mu, sigma)``.
-        New log-prob is computed from the current policy with proper tanh
-        Jacobian correction:
-
-            log π(a|s) = log N(u) - Σ log(1 - tanh²(u) + ε)
-
-        Returns ``(actor_loss, ratio, approx_kl, approx_kl_log, clip_fraction, entropy)``
-        where:
-
-        * ``ratio = exp(new_log_prob - old_log_prob)`` (PPO importance ratio)
-        * ``approx_kl = E[0.5 (ratio - 1)²]`` (KL divergence estimate)
-        * ``approx_kl_log = E[ratio - 1 - log(ratio)]`` (log-space KL for target KL)
-        """
-        # Compute log-prob at raw action using current policy (with Jacobian correction)
-        new_logp, entropy = self.actor.evaluate(obs, act_raw)
+        """Evaluate the integer action using its original sampling mask."""
+        new_logp, entropy = self.actor.evaluate(obs, action, action_mask)
 
         log_ratio = (new_logp - old_logp).clamp(-LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
         ratio = log_ratio.exp()
@@ -249,12 +218,7 @@ class PPOTrainer(BaseTrainer):
         else:
             segment_ids = np.asarray(segment_ids)
         same_length = (
-            len(done)
-            == len(val)
-            == len(next_val)
-            == len(bootstrap_mask)
-            == len(segment_ids)
-            == n
+            len(done) == len(val) == len(next_val) == len(bootstrap_mask) == len(segment_ids) == n
         )
         if not same_length:
             raise ValueError("GAE inputs must have identical length")
@@ -418,8 +382,7 @@ class PPOTrainer(BaseTrainer):
             return {}
         obs = np.stack([t.obs for t in rollout]).astype(np.float32)
         next_obs = np.stack([t.next_obs for t in rollout]).astype(np.float32)
-        act = np.asarray([t.action for t in rollout], dtype=np.float32).reshape(-1, 1)
-        act_raw = np.asarray([t.action_raw for t in rollout], dtype=np.float32).reshape(-1, 1)
+        act = np.asarray([t.action for t in rollout], dtype=np.int64)
         rew = np.asarray([t.reward for t in rollout], dtype=np.float32)
         old_logp = np.asarray([t.log_prob for t in rollout], dtype=np.float32).reshape(-1, 1)
         val = np.asarray([t.value for t in rollout], dtype=np.float32)
@@ -429,7 +392,6 @@ class PPOTrainer(BaseTrainer):
         self._check_first_nonfinite("observation", obs, dim=obs.shape[1])
         self._check_first_nonfinite("next_observation", next_obs, dim=next_obs.shape[1])
         self._check_first_nonfinite("action", act, dim=1)
-        self._check_first_nonfinite("raw_action", act_raw, dim=1)
         self._check_first_nonfinite("reward", rew, dim=None)
         self._check_first_nonfinite("value_prediction", val, dim=None)
         self._check_first_nonfinite("next_value_prediction", next_val, dim=None)
@@ -444,8 +406,17 @@ class PPOTrainer(BaseTrainer):
 
         # -- stage 2: tensors -------------------------------------------------
         obs_t = torch.as_tensor(obs, device=self.device)
-        act_raw_t = torch.as_tensor(act_raw, device=self.device)
+        if any(
+            t.action_mask is None or not isinstance(t.action, (int, np.integer)) for t in rollout
+        ):
+            raise ValueError("PPO transitions require integer actions and original action masks")
+        masks = np.stack([cast(np.ndarray, t.action_mask) for t in rollout]).astype(bool)
+        act_t = torch.as_tensor(act, dtype=torch.long, device=self.device)
+        mask_t = torch.as_tensor(masks, dtype=torch.bool, device=self.device)
         old_logp_t = torch.as_tensor(old_logp, device=self.device)
+        with torch.no_grad():
+            initial_logp, _ = self.actor.evaluate(obs_t, act_t, mask_t)
+            initial_ratio_error = float(((initial_logp - old_logp_t).exp() - 1).abs().max())
         adv_t = torch.as_tensor(adv, device=self.device).unsqueeze(1)
         ret_t = torch.as_tensor(returns, device=self.device).unsqueeze(1)
 
@@ -481,20 +452,15 @@ class PPOTrainer(BaseTrainer):
                 idx = perm[start : start + batch]
 
                 # -- actor output stability ------------------------------------
-                dist = self.actor.dist(obs_t[idx])
-                log_std = torch.log(dist.scale)
-                self._check_first_nonfinite("actor_mean", dist.mean, dim=None)
-                self._check_first_nonfinite("actor_log_std", log_std, dim=None)
-                self._check_first_nonfinite("actor_std", dist.scale, dim=None)
-                if torch.any(dist.scale <= 0):
-                    self._check_first_nonfinite("actor_std_nonpositive", dist.scale, dim=None)
+                self._check_first_nonfinite("actor_logits", self.actor(obs_t[idx]), dim=None)
 
                 actor_loss, _ratio, approx_kl, approx_kl_log, clip_frac, entropy = (
                     self._minibatch_actor(
                         obs_t[idx],
-                        act_raw_t[idx],
+                        act_t[idx],
                         old_logp_t[idx],
                         adv_t[idx],
+                        action_mask=mask_t[idx],
                         eps=eps,
                         ent_coef=ent_coef,
                     )
@@ -563,16 +529,10 @@ class PPOTrainer(BaseTrainer):
                     flush=True,
                 )
 
-        # -- stage 3: action-distribution stats for the trading policy ---------
-        a = act.ravel()
-        mean_action = float(np.mean(a))
-        std_action = float(np.std(a))
-        mean_abs_action = float(np.mean(np.abs(a)))
-        frac_near_minus_one = float(np.mean(a < -0.999))
-        frac_near_zero = float(np.mean(np.abs(a) < 0.001))
-        frac_near_plus_one = float(np.mean(a > 0.999))
-
         diag = {
+            "initial_ratio_max_error": initial_ratio_error,
+            "invalid_actions_sampled": 0.0,
+            "nonfinite_total": float(self._nonfinite_total),
             "actor_loss": total_actor / max(1, n_batches),
             "critic_loss": total_value / max(1, n_batches),
             "entropy": total_entropy / max(1, n_batches),
@@ -599,18 +559,13 @@ class PPOTrainer(BaseTrainer):
             "advantage_std": adv_stats.get("std") or 0.0,
             "advantage_min": adv_stats.get("min") or 0.0,
             "advantage_max": adv_stats.get("max") or 0.0,
-            "mean_action": mean_action,
-            "std_action": std_action,
-            "mean_abs_action": mean_abs_action,
-            "frac_near_minus_one": frac_near_minus_one,
-            "frac_near_zero": frac_near_zero,
-            "frac_near_plus_one": frac_near_plus_one,
             "alpha": 0.0,
             "alpha_loss": 0.0,
             "q1": float(np.mean(val)),
             "q2": 0.0,
         }
         diag.update(integrity)
+        diag.update(self.action_diagnostics.summary())
         self._last_diag = diag
         return diag
 
@@ -621,6 +576,33 @@ class PPOTrainer(BaseTrainer):
             for k in ("entropy", "actor_loss", "approx_kl", "clip_fraction")
             if k in d
         }
+
+    def _record_diagnostics(self, diag: dict[str, float]) -> None:
+        super()._record_diagnostics(diag)
+        self.update_history.append(dict(diag))
+
+    def _collect_warnings(self) -> list[str]:
+        stats = self.action_diagnostics.summary()
+        messages = []
+        for action in ("hold", "flat"):
+            if stats[f"pct_{action}"] > 90:
+                messages.append(f"Learned behavior: mostly {action.upper()}")
+        if stats["pct_long_100"] + stats["pct_short_100"] > 90:
+            messages.append("Learned behavior: mostly LONG_100/SHORT_100")
+        return messages
+
+    def finalize(self) -> dict[str, Any]:
+        import json
+
+        summary = super().finalize()
+        summary["action_diagnostics"] = self.action_diagnostics.summary()
+        (self.run_dir / "training_summary.json").write_text(
+            json.dumps(summary, indent=2, default=str), encoding="utf-8"
+        )
+        (self.run_dir / "ppo_updates.json").write_text(
+            json.dumps(self.update_history, indent=2), encoding="utf-8"
+        )
+        return summary
 
     # -- checkpointing --------------------------------------------------------
 
@@ -651,8 +633,14 @@ class PPOTrainer(BaseTrainer):
             self.value_opt.load_state_dict(opts["value_opt"])
 
     def _local_rng_state(self) -> dict[str, Any]:
-        return {"ppo_minibatch_rng": self._rng.bit_generator.state}
+        return {
+            "ppo_minibatch_rng": self._rng.bit_generator.state,
+            "action_diagnostics": self.action_diagnostics.state_dict(),
+            "update_history": self.update_history,
+        }
 
     def _load_local_rng_state(self, state: dict[str, Any]) -> None:
+        self.action_diagnostics.load_state_dict(state.get("action_diagnostics", {}))
+        self.update_history = list(state.get("update_history", []))
         if state.get("ppo_minibatch_rng"):
             self._rng.bit_generator.state = state["ppo_minibatch_rng"]

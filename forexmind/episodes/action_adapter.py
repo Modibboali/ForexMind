@@ -1,6 +1,6 @@
 """Action-space adapters (Phase 2).
 
-The environment already accepts both discrete indices (0..4) and continuous
+The environment already accepts both discrete indices (0..9) and continuous
 target exposures in [-1, +1].  These adapters make the mapping explicit so RL
 agents can consume either representation later (MuZero: discrete; SAC:
 continuous) without changing the environment or portfolio logic.
@@ -19,9 +19,9 @@ from forexmind.environment.actions import (
 
 
 class DiscreteActionAdapter:
-    """Maps a discrete action index in {0..4} to a target exposure.
+    """Maps a discrete action index in {0..9} to a target exposure.
 
-    0 -> -1.0, 1 -> -0.5, 2 -> 0.0, 3 -> +0.5, 4 -> +1.0
+    HOLD, FLAT, four short levels, four long levels; see environment.actions.
     """
 
     n_actions: int = len(TARGET_EXPOSURES)
@@ -34,7 +34,7 @@ class DiscreteActionAdapter:
 
     @property
     def action_values(self) -> np.ndarray:
-        return np.asarray(TARGET_EXPOSURES, dtype=np.float32)
+        return np.asarray(TARGET_EXPOSURES, dtype=object)  # None is the HOLD sentinel
 
 
 class ContinuousActionAdapter:

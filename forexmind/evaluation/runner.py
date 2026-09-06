@@ -17,6 +17,7 @@ import math
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from typing import cast
 
 import numpy as np
 
@@ -145,19 +146,31 @@ class EvaluationRunner:
         equity = [initial_equity]
         positions: list[float] = []
         trade_log: list[dict[str, object]] = []
+        action_indices: list[int] = []
+        action_diagnostics: list[dict] = []
         prev_units = _to_float(info["position_units"])
 
         for step in range(spec.horizon):
             window = builder.build(env.current_obs_index)
             encoded = self.encoder.encode(obs, window)
+            if hasattr(agent, "set_action_mask"):
+                agent.set_action_mask(env.action_masks())
             action = agent.act(encoded)
-            obs, reward, terminated, truncated, info = env.step(action.target_exposure)
+            obs, reward, terminated, truncated, info = env.step(action)
+            action_index = getattr(agent, "last_action_index", None)
+            if action_index is not None:
+                action_indices.append(action_index)
+                action_diagnostics.append(cast(dict, info["action_diagnostics"]))
 
             new_equity = _to_float(info["equity"])
             equity.append(new_equity)
             rewards.append(float(reward))
             timestamps.append(np.datetime64(obs.timestamp))
-            actions.append(float(action.target_exposure))
+            actions.append(
+                float(action_index)
+                if action_index is not None
+                else float(cast(float, action.target_exposure))
+            )
             log_returns.append(math.log(new_equity / equity[-2]) if equity[-2] > 0 else 0.0)
             positions.append(_to_float(info["position_units"]))
 
@@ -205,7 +218,7 @@ class EvaluationRunner:
             agent_name=agent.name,
             spec=spec,
             timestamps=np.asarray(timestamps, dtype="datetime64[ns]"),
-            actions=np.asarray(actions, dtype=np.float32),
+            actions=np.asarray(actions, dtype=np.int64 if action_indices else np.float32),
             rewards=np.asarray(rewards, dtype=np.float64),
             equity=np.asarray(equity, dtype=np.float64),
             log_returns=np.asarray(log_returns, dtype=np.float64),
@@ -217,6 +230,9 @@ class EvaluationRunner:
                 "initial_balance": initial_balance,
                 "final_equity": float(equity[-1]),
                 "n_steps": len(rewards),
+                "action_indices": action_indices,
+                "action_diagnostics": action_diagnostics,
+                "action_semantics": "categorical_v1" if action_indices else "continuous_exposure",
             },
         )
         periods = self.periods_per_year(spec.split)

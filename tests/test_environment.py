@@ -74,7 +74,7 @@ def test_reset_returns_obs_and_info() -> None:
 def test_step_returns_five_tuple() -> None:
     env = ForexEnvironment(_dataset(), _config())
     env.reset(seed=0, start_index=0, horizon=5)
-    obs, reward, terminated, truncated, info = env.step(2)  # flat
+    obs, reward, terminated, truncated, info = env.step(1)  # flat
     assert not terminated
     assert not truncated
     assert reward == 0.0
@@ -85,7 +85,7 @@ def test_step_returns_five_tuple() -> None:
 def test_step_to_long_opens_position() -> None:
     env = ForexEnvironment(_dataset(), _config())
     env.reset(seed=0, start_index=0, horizon=5)
-    _obs, _reward, _terminated, _truncated, info = env.step(4)  # +1.0 full long
+    _obs, _reward, _terminated, _truncated, info = env.step(9)  # +1.0 full long
     assert info["position"] == "long"
     assert info["position_units"] == Decimal("10000")
     assert info["execution_price"] == Decimal("1.10")
@@ -102,7 +102,7 @@ def test_equity_fraction_sizing() -> None:
     )
     env = ForexEnvironment(_dataset(price=1.10), cfg)
     env.reset(seed=0, start_index=0)
-    obs, *_ = env.step(4)
+    obs, *_ = env.step(9)
     # exposure 1.0 * equity 10000 / price 1.10
     assert obs.account.position_units == Decimal("10000") / Decimal("1.10")
 
@@ -111,11 +111,11 @@ def test_truncation_at_horizon() -> None:
     env = ForexEnvironment(_dataset(), _config(horizon=3))
     env.reset(seed=0, start_index=0)
     for _ in range(3):
-        _obs, _r, terminated, truncated, _info = env.step(2)
+        _obs, _r, terminated, truncated, _info = env.step(1)
     assert truncated
     assert terminated is False
     with pytest.raises(EnvironmentError):
-        env.step(2)
+        env.step(1)
 
 
 def test_no_future_leakage_in_window() -> None:
@@ -126,7 +126,7 @@ def test_no_future_leakage_in_window() -> None:
     assert {b.timestamp for b in obs.market_window} <= {
         t for t in m5_ts if t <= pd.Timestamp("2025-01-06 00:10")
     }
-    obs, *_ = env.step(2)
+    obs, *_ = env.step(1)
     # After one step, window still only contains bars up to the new index.
     latest = max(b.timestamp for b in obs.market_window)
     assert latest == pd.Timestamp("2025-01-06 00:15")
@@ -191,15 +191,15 @@ def test_liquidation_terminates_episode() -> None:
     ds.add(InstrumentData.from_m1("EURUSD", m1))
     env = ForexEnvironment(ds, cfg)
     env.reset(seed=0, start_index=0)
-    _obs, _r0, t0, _tr0, info0 = env.step(4)  # go long at 00:05 open 1.095
+    _obs, _r0, t0, _tr0, info0 = env.step(9)  # go long at 00:05 open 1.095
     assert info0["position"] == "long"
     assert not t0
-    _obs, _r1, t1, _tr1, info1 = env.step(4)  # hold; marked at 00:10+ close 1.05
+    _obs, _r1, t1, _tr1, info1 = env.step(9)  # hold; marked at 00:10+ close 1.05
     assert t1, "liquidation should terminate the episode"
     assert info1["liquidation"] is True
     assert info1["position"] == "flat"
     with pytest.raises(EnvironmentError):
-        env.step(4)
+        env.step(9)
 
 
 def test_action_sequence_produces_pnl() -> None:
@@ -210,7 +210,7 @@ def test_action_sequence_produces_pnl() -> None:
     env = ForexEnvironment(ds, _config(horizon=8, close_at_episode_end=True))
     env.reset(seed=0, start_index=0)
     for i in range(8):
-        action = 4 if i < 6 else 2  # full long, then flat at the end
+        action = 9 if i < 6 else 1  # full long, then flat at the end
         _obs, _reward, _terminated, truncated, _info = env.step(action)
         if truncated:
             break
@@ -225,7 +225,7 @@ def test_close_at_episode_end_option() -> None:
     env = ForexEnvironment(ds, _config(horizon=3, close_at_episode_end=True))
     env.reset(seed=0, start_index=0)
     for _ in range(3):
-        _obs, _r, _term, _trunc, info = env.step(4)
+        _obs, _r, _term, _trunc, info = env.step(9)
     assert env.portfolio is not None
     assert env.portfolio.position.is_flat
     assert info["position"] == "flat"

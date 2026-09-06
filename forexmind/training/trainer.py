@@ -125,7 +125,7 @@ class BaseTrainer(ABC):
             seed=config.compute.seed,
         )
         self.obs_dim = self.encoder.config.spec.encoded_shape[0]
-        self.action_dim = 1
+        self.action_dim = 10 if config.algorithm.name == "ppo" else 1
 
         self._resolve_worker_count()
 
@@ -319,8 +319,6 @@ class BaseTrainer(ABC):
                 action_dim=self.action_dim,
                 global_seed=cfg.compute.seed,
                 num_workers=self._resolved_num_workers,
-                log_std_min=cfg.training.log_std_min,
-                log_std_max=cfg.training.log_std_max,
                 dataset_backend=cfg.compute.dataset_backend,
             )
         worker = EnvWorker(
@@ -465,6 +463,11 @@ class BaseTrainer(ABC):
         for t in transitions:
             worker_id = int(t.worker_id)
             if worker_id not in self._episode_reward_by_worker:
+                self._episode_reward_by_worker[worker_id] = 0.0
+                self._episode_steps_by_worker[worker_id] = 0
+            # Collectors restart episodes on resume. Never attach a saved partial
+            # episode's statistics to the first fresh worker trajectory.
+            if t.trajectory_step == 0 and self._episode_steps_by_worker[worker_id] > 0:
                 self._episode_reward_by_worker[worker_id] = 0.0
                 self._episode_steps_by_worker[worker_id] = 0
             self._env_steps += 1
@@ -773,8 +776,6 @@ class BaseTrainer(ABC):
                     "critic_lr="
                     f"{self.config.training.critic_lr or self.config.training.learning_rate} "
                     f"max_grad_norm={self.config.training.max_grad_norm} "
-                    f"log_std=[{self.config.training.log_std_min},"
-                    f"{self.config.training.log_std_max}] "
                     f"finite_check={self.config.training.finite_check}"
                 ),
                 "Dataset backend": getattr(self, "dataset_backend", "unknown"),

@@ -1,10 +1,4 @@
-"""Policy construction and action sampling (Phase 3).
-
-A single :func:`build_policy_network` returns the right torch module for the
-algorithm (SAC actor or PPO Gaussian policy).  :func:`sample_action` converts a
-flat encoded observation to a target exposure in [-1, 1]; ``deterministic``
-uses the policy mean (evaluation), otherwise it samples (exploration).
-"""
+"""Categorical masked PPO and continuous SAC policy construction."""
 
 from __future__ import annotations
 
@@ -18,11 +12,8 @@ from forexmind.environment.actions import Action
 from forexmind.observation.schema import EncodedObservation
 from forexmind.training.config import ModelConfig
 from forexmind.training.networks import (
-    LOG_STD_MAX,
-    LOG_STD_MIN,
-    GaussianPolicy,
+    CategoricalPolicy,
     SquashedGaussianActor,
-    TanhGaussianPolicy,
 )
 
 
@@ -31,20 +22,11 @@ def build_policy_network(
     obs_dim: int,
     action_dim: int,
     model: ModelConfig,
-    *,
-    log_std_min: float | None = None,
-    log_std_max: float | None = None,
 ) -> nn.Module:
     if algorithm == "sac":
         return SquashedGaussianActor(obs_dim, action_dim, model)
     if algorithm == "ppo":
-        return GaussianPolicy(
-            obs_dim,
-            action_dim,
-            model,
-            log_std_min=LOG_STD_MIN if log_std_min is None else log_std_min,
-            log_std_max=LOG_STD_MAX if log_std_max is None else log_std_max,
-        )
+        return CategoricalPolicy(obs_dim, model)
     raise ValueError(f"unsupported algorithm {algorithm!r}; use 'sac' or 'ppo'")
 
 
@@ -56,23 +38,20 @@ def sample_action(
     *,
     deterministic: bool = False,
     device: str | torch.device = "cpu",
-) -> float:
-    """Sample (or deterministically select) a target exposure from a flat obs.
-
-    For PPO: The tanh-squashed Gaussian policy naturally produces actions in (-1, 1).
-    No clamping is required (tanh is strictly bounded).
-
-    For SAC: The SquashedGaussianActor also uses tanh and produces actions in (-1, 1).
-
-    Returns a float in (-1, 1).
-    """
+    action_mask: np.ndarray | None = None,
+) -> int | float:
+    """Return a masked PPO integer index or a continuous SAC exposure."""
     obs = torch.as_tensor(np.asarray(obs_flat, dtype=np.float32), device=device).unsqueeze(0)
     if algorithm == "sac":
         sac_policy = cast(SquashedGaussianActor, policy)
         action = sac_policy.deterministic(obs) if deterministic else sac_policy.sample(obs)[0]
     elif algorithm == "ppo":
-        ppo_policy = cast(TanhGaussianPolicy, policy)
-        action = ppo_policy.act(obs, deterministic=deterministic)
+        if action_mask is None:
+            raise ValueError("PPO requires the current environment action mask")
+        mask = torch.as_tensor(action_mask, dtype=torch.bool, device=device).unsqueeze(0)
+        ppo_policy = cast(CategoricalPolicy, policy)
+        action = ppo_policy.act(obs, mask, deterministic=deterministic)
+        return int(action.item())
     else:  # pragma: no cover - guarded in build_policy_network
         raise ValueError(f"unsupported algorithm {algorithm!r}")
     return float(action.item())
@@ -82,7 +61,7 @@ class PolicyAgent:
     """A Phase-2 :class:`TradingAgent` wrapper around a torch policy.
 
     Used for evaluation (validation/test) through the existing
-    ``EvaluationRunner`` with deterministic action selection (policy mean).
+    ``EvaluationRunner`` with deterministic action selection (masked argmax for PPO).
     """
 
     def __init__(
@@ -98,9 +77,15 @@ class PolicyAgent:
         self.name = name or algorithm
         self._device = device
         self.policy.eval()
+        self.action_mask: np.ndarray | None = None
+        self.last_action_index: int | None = None
 
     def reset(self, seed: int | None = None) -> None:
-        pass
+        self.action_mask = None
+        self.last_action_index = None
+
+    def set_action_mask(self, mask: np.ndarray) -> None:
+        self.action_mask = mask.copy()
 
     def act(self, observation: EncodedObservation) -> Action:
         action = sample_action(
@@ -109,5 +94,9 @@ class PolicyAgent:
             self.algorithm,
             deterministic=True,
             device=self._device,
+            action_mask=self.action_mask,
         )
-        return Action(action)
+        from forexmind.environment.actions import resolve_action
+
+        self.last_action_index = int(action) if self.algorithm == "ppo" else None
+        return resolve_action(action)

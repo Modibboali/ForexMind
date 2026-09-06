@@ -245,28 +245,49 @@ dataset has no historical bid/ask.
 
 ## 7. Actions
 
-The action space is **target exposure**, not BUY/SELL/HOLD:
+PPO uses `gymnasium.spaces.Discrete(10)`:
 
+| Index | Action | Target exposure |
+|---:|---|---:|
+| 0 | HOLD | Preserve exact units |
+| 1 | FLAT | 0.00 |
+| 2 | SHORT_100 | -1.00 |
+| 3 | SHORT_75 | -0.75 |
+| 4 | SHORT_50 | -0.50 |
+| 5 | SHORT_25 | -0.25 |
+| 6 | LONG_25 | +0.25 |
+| 7 | LONG_50 | +0.50 |
+| 8 | LONG_75 | +0.75 |
+| 9 | LONG_100 | +1.00 |
+
+HOLD bypasses sizing and execution. FLAT closes to zero units with normal
+costs. Exposure actions retain account-currency sizing:
+`units = exposure * equity / (price * quote_to_account_factor)`.
+Raw float exposure actions remain supported for SAC and baseline agents.
+
+The causal mask always allows HOLD. It masks FLAT only at zero units, and
+masks the nearest nonzero exposure target only within 0.001 absolute exposure
+(0.1 percentage point of equity). The observation already includes signed
+exposure, units, PnL, equity, free margin, and entry-distance information.
+
+PPO outputs ten logits and stores each integer action with its original
+boolean mask and log-probability. Continuous PPO checkpoints are explicitly
+rejected; start a new run. Reward, execution timing, accounting, and GAE are
+unchanged. Existing mandatory liquidation and configured episode-end closure
+still apply independently of policy decisions and are counted separately.
+
+Run the bounded correctness experiment before full training:
+
+```powershell
+python -m tools.validate_categorical_ppo
 ```
--1.0  fully short     -0.5  half short     0.0  flat
-+0.5  half long       +1.0  fully long
-```
 
-The action means *"adjust the portfolio to the requested target exposure"*.
-Position sizing maps an exposure in `[-1, +1]` to base units so that the
-**account-currency gross exposure** equals `|exposure| * equity`:
-
-- `equity_fraction` (default, account-currency aware):
-  `units = (exposure * equity) / (price * quote_to_account_factor)`
-  For USD-quote pairs this is `exposure * equity / price`; for USD/XXX pairs
-  it is `≈ exposure * equity` (one base USD == one USD notional).
-- `fixed_units`: `units = exposure * fixed_units`
-
-This formulation maps naturally to discrete MuZero actions later and can be
-extended to continuous targets.
+It uses 100,352 training steps, two workers, and 28 fixed-seed validation
+episodes. Results include all ten action frequencies, HOLD streaks, position
+durations, executions, reversals, transitions, and turnover. See
+[Stage 3.4 report](docs/stage34_categorical_ppo.md) for results and definitions.
 
 ---
-
 ## 8. Reward
 
 The reward is the log change in **account-currency** equity (transaction costs
@@ -631,7 +652,7 @@ Goals:
 
 - Continuous **target-exposure** actions in $[-1, 1]$ (long/flat/short).
 - **SAC** with twin critics + target critics and **automatic entropy
-  temperature**; **PPO** with a clipped Gaussian policy and GAE.
+  temperature**; **PPO** with a masked categorical policy, clipped objective, and GAE.
 - **Multi-CPU** training: worker processes are independent of the learner and
   configurable (`num_workers`), with CPU oversubscription prevented by setting
   `torch.set_num_threads` + `OMP/MKL_NUM_THREADS`.
@@ -711,7 +732,7 @@ directory, checkpoint, and manifest, so runs are reproducible.
 forexmind/training/
     __init__.py            # SACTrainer, PPOTrainer, ExperimentConfig
     config.py              # ExperimentConfig + nested dataclasses (YAML/JSON)
-    networks.py            # MLP, SquashedGaussianActor, TwinQCritic, GaussianPolicy, ValueNet
+    networks.py            # MLP, SquashedGaussianActor, TwinQCritic, CategoricalPolicy, ValueNet
     replay.py              # high-throughput numpy ring buffer (train split only)
     data.py                # processed-parquet dataset access + startup report
     policies.py            # build_policy_network, sample_action, PolicyAgent (eval)
@@ -753,5 +774,3 @@ tests/                     # Phase 3 tests (SAC, workers, data, eval, repro)
   session (e.g. Kaggle) keep `num_workers` small (2–4) and `total_env_steps`
   modest for a first run; each worker re-imports torch and loads the parquet
   dataset, so hundreds of workers will OOM the session.
-
-

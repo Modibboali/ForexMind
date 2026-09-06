@@ -8,7 +8,9 @@ modest (``hidden_dim=256``, ``num_layers=2`` by default).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
@@ -100,7 +102,7 @@ class TwinQCritic(nn.Module):
 
 
 class TanhGaussianPolicy(nn.Module):
-    """PPO tanh-squashed Gaussian policy (mean + learned log-std), continuous actions.
+    """Legacy continuous policy retained for compatibility; PPO uses CategoricalPolicy.
 
     **Mathematically correct bounded continuous policy:**
 
@@ -224,6 +226,65 @@ class ValueNet(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.net(obs)
+
+
+class CategoricalPolicy(nn.Module):
+    """Ten trading logits with a required, causal boolean action mask."""
+
+    def __init__(self, obs_dim: int, config: ModelConfig) -> None:
+        super().__init__()
+        self.action_dim = 10
+        self.logits_net = MLP(obs_dim, self.action_dim, config)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.logits_net(obs)
+
+    def dist(self, obs: torch.Tensor, action_mask: torch.Tensor) -> torch.distributions.Categorical:
+        logits = self(obs)
+        mask = torch.as_tensor(action_mask, dtype=torch.bool, device=logits.device)
+        if mask.shape != logits.shape or not bool(mask[..., 0].all()):
+            raise ValueError("action mask must match logits and always allow HOLD")
+        if not bool(torch.isfinite(logits).all()):
+            raise ValueError("non-finite categorical actor logits")
+        return torch.distributions.Categorical(
+            logits=logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+        )
+
+    def sample(
+        self, obs: torch.Tensor, action_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dist = self.dist(obs, action_mask)
+        action = dist.sample()
+        return action, dist.log_prob(action).unsqueeze(-1)
+
+    def act(
+        self, obs: torch.Tensor, action_mask: torch.Tensor, deterministic: bool = False
+    ) -> torch.Tensor:
+        dist = self.dist(obs, action_mask)
+        return dist.logits.argmax(-1) if deterministic else dist.sample()
+
+    def evaluate(
+        self, obs: torch.Tensor, action: torch.Tensor, action_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dist = self.dist(obs, action_mask)
+        if action.dtype != torch.long:
+            raise ValueError("categorical actions must be integer indices")
+        action = action.reshape(-1)
+        if bool(((action < 0) | (action >= self.action_dim)).any()):
+            raise ValueError("categorical action index out of range")
+        if not bool(action_mask.gather(-1, action.unsqueeze(-1)).all()):
+            raise ValueError("stored categorical action is invalid under its sampling mask")
+        return dist.log_prob(action).unsqueeze(-1), dist.entropy().unsqueeze(-1)
+
+    def load_state_dict(
+        self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
+    ) -> Any:
+        if any(k == "log_std" or k.startswith("mean_net.") for k in state_dict):
+            raise ValueError(
+                "Checkpoint uses continuous PPO action policy and is incompatible with "
+                "the categorical PPO actor. Start a new categorical PPO run."
+            )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
 
 def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:

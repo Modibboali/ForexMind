@@ -77,6 +77,14 @@ def _pooled_turnover(trajectories: list[Any]) -> float:
 
 def _ppo_action_statistics(trajectories: list[Any]) -> dict[str, Any]:
     """Compute PPO action statistics (mean/std/min/max, % long/short/flat, position changes)."""
+    if trajectories and all(
+        t.info.get("action_semantics") == "categorical_v1" for t in trajectories
+    ):
+        from forexmind.training.evaluator import _action_diagnostics
+
+        stats = _action_diagnostics(trajectories)
+        stats["n_trades"] = stats["actual_executions"]
+        return stats
     all_actions = []
     all_position_units = []
     all_trades = 0
@@ -325,17 +333,8 @@ def print_summary(result: dict[str, Any]) -> None:
     ppo_action_stats = agents.get("ppo", {}).get("action_stats", {})
     print("PPO ACTION STATISTICS")
     print("-" * 80)
-    print(f"Mean action         : {ppo_action_stats.get('action_mean', 0):>10.6f}")
-    print(f"Std action          : {ppo_action_stats.get('action_std', 0):>10.6f}")
-    print(f"Min action          : {ppo_action_stats.get('action_min', 0):>10.6f}")
-    print(f"Max action          : {ppo_action_stats.get('action_max', 0):>10.6f}")
-    print(f"Mean abs action     : {ppo_action_stats.get('action_mean_abs', 0):>10.6f}")
-    print(f"% long (> 0)        : {ppo_action_stats.get('pct_long', 0):>10.2f}%")
-    print(f"% short (< 0)       : {ppo_action_stats.get('pct_short', 0):>10.2f}%")
-    print(f"% flat (≈ 0)        : {ppo_action_stats.get('pct_flat', 0):>10.2f}%")
-    print(f"Position changes    : {ppo_action_stats.get('position_changes', 0):>10}")
-    print(f"Total trades        : {ppo_action_stats.get('n_trades', 0):>10}")
-    print()
+    for key, value in ppo_action_stats.items():
+        print(f"{key:<40}: {value}")
 
 
 def save_results(result: dict[str, Any], out_dir: str | Path) -> dict[str, Path]:

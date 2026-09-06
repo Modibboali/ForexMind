@@ -344,7 +344,7 @@ def load_checkpoint_policy(
     """Build the policy network and load weights from a checkpoint file.
 
     Builds the algorithm-appropriate policy (``SquashedGaussianActor`` for
-    SAC, ``GaussianPolicy`` for PPO) from the checkpoint's ``algorithm``
+    SAC, ``CategoricalPolicy`` for PPO) from the checkpoint's ``algorithm``
     field.  Previously this hardcoded SAC networks, so evaluating a PPO
     checkpoint returned a SAC actor while the caller dispatched on "ppo"
     -> AttributeError: 'SquashedGaussianActor' has no attribute 'act'.
@@ -361,8 +361,6 @@ def load_checkpoint_policy(
         obs_dim,
         1,
         exp_cfg.model,
-        log_std_min=exp_cfg.training.log_std_min,
-        log_std_max=exp_cfg.training.log_std_max,
     )
     policy.load_state_dict({k: torch.as_tensor(v) for k, v in state["policy"].items()})
     policy.eval()

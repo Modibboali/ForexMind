@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
     "pyarrow>=14",
+    "gymnasium>=1.0",
 ]
 
 [project.optional-dependencies]

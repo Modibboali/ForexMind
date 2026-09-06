@@ -55,7 +55,7 @@ def _transition(
     obs = np.full(trainer.obs_dim, worker_id + trajectory_id * 0.01, dtype=np.float32)
     return Transition(
         obs=obs,
-        action=0.0,
+        action=0,
         reward=reward,
         next_obs=obs + 1.0,
         terminated=terminated,
@@ -68,7 +68,7 @@ def _transition(
         trajectory_id=trajectory_id,
         trajectory_step=trajectory_step,
         rollout_fragment_id=rollout_fragment_id,
-        action_raw=0.0,
+        action_mask=np.ones(10, dtype=bool),
     )
 
 
