@@ -20,10 +20,11 @@ from forexmind.muzero import (
     build_muzero_network,
     observation_dim,
 )
+from forexmind.muzero.actions import MUZERO_NUM_ACTIONS
 from forexmind.muzero.config import observation_dim as observation_dim_fn
 from forexmind.observation.encoder import EncoderConfig
 
-NUM_ACTIONS = 10
+NUM_ACTIONS = MUZERO_NUM_ACTIONS
 
 
 def make_config(**overrides) -> MuZeroConfig:
@@ -221,7 +222,7 @@ def test_dynamics_uses_embedding_not_raw_index(model: MuZeroNetwork) -> None:
     latent = torch.zeros(1, model.config.latent_dim)
     with torch.no_grad():
         out_a = model.dynamics(latent, torch.tensor([0]))
-        out_b = model.dynamics(latent, torch.tensor([9]))
+        out_b = model.dynamics(latent, torch.tensor([NUM_ACTIONS - 1]))
     assert not torch.allclose(out_a[0], out_b[0])
 
 
@@ -374,7 +375,7 @@ def test_synthetic_loss_produces_finite_gradients(model: MuZeroNetwork) -> None:
     obs = _obs(4, model.config.obs_dim)
     root = model.initial_inference(obs)
     child = model.recurrent_inference(root.latent_state, torch.tensor([0, 1, 2, 3]))
-    target = torch.tensor([0, 4, 2, 9])
+    target = torch.tensor([0, 4, 2, NUM_ACTIONS - 1])
     loss = (
         F.cross_entropy(root.policy_logits, target)
         + F.cross_entropy(child.policy_logits, target)
@@ -410,7 +411,7 @@ def test_reward_head_receives_gradient(model: MuZeroNetwork) -> None:
 def test_five_step_latent_unroll_is_stable(model: MuZeroNetwork) -> None:
     torch.manual_seed(1)
     obs = _obs(2, model.config.obs_dim)
-    sequence = [0, 3, 7, 9, 4]
+    sequence = [0, 3, 4, NUM_ACTIONS - 1, 2]
     with torch.no_grad():
         out = model.initial_inference(obs)
         latents = [out.latent_state]
@@ -434,7 +435,7 @@ def test_different_action_sequences_diverge(model: MuZeroNetwork) -> None:
         seq_b = root.latent_state
         for action in [2, 2, 2, 2, 2]:
             seq_a = model.recurrent_inference(seq_a, action).latent_state
-        for action in [9, 9, 9, 9, 9]:
+        for action in [5, 5, 5, 5, 5]:
             seq_b = model.recurrent_inference(seq_b, action).latent_state
     assert not torch.allclose(seq_a, seq_b, atol=1e-6)
 
@@ -445,10 +446,10 @@ def test_action_order_matters(model: MuZeroNetwork) -> None:
     with torch.no_grad():
         root = model.initial_inference(obs)
         ab = root.latent_state
-        for action in (1, 8):
+        for action in (1, NUM_ACTIONS - 1):
             ab = model.recurrent_inference(ab, action).latent_state
         ba = root.latent_state
-        for action in (8, 1):
+        for action in (NUM_ACTIONS - 1, 1):
             ba = model.recurrent_inference(ba, action).latent_state
     assert not torch.allclose(ab, ba, atol=1e-6)
 

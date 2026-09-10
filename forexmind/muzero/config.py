@@ -11,8 +11,10 @@ before scale.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any
+
+from forexmind.muzero.actions import MUZERO_NUM_ACTIONS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forexmind.observation.encoder import EncoderConfig
@@ -43,8 +45,10 @@ class MuZeroConfig:
     obs_dim:
         Flat observation dimension (see :func:`observation_dim`).
     num_actions:
-        Size of the categorical action space.  ForexMind defines exactly 10
-        actions (``HOLD``, ``FLAT``, 4 shorts, 4 longs); this must not change.
+        Size of the categorical action space.  MuZero uses the frozen six-action
+        space (:data:`forexmind.muzero.actions.MUZERO_NUM_ACTIONS`):
+        ``HOLD``, ``FLAT``, ``SHORT_100``, ``SHORT_50``, ``LONG_50``,
+        ``LONG_100``.  The network itself is generic in this dimension.
     latent_dim:
         Dimension of the learned latent state produced by ``h_theta``.
     hidden_dim:
@@ -75,7 +79,7 @@ class MuZeroConfig:
     """
 
     obs_dim: int
-    num_actions: int = 10
+    num_actions: int = MUZERO_NUM_ACTIONS
     latent_dim: int = 128
     hidden_dim: int = 256
     action_embedding_dim: int = 16
@@ -151,6 +155,80 @@ class MuZeroConfig:
     ) -> MuZeroConfig:
         """Build a config whose ``obs_dim`` follows the Phase-2 encoder."""
         return cls(obs_dim=observation_dim(encoder_config), **overrides)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class SearchConfig:
+    """MuZero MCTS / PUCT hyperparameters (Stage 4.2).
+
+    Every constant used by the search lives here; the search implementation
+    never hard-codes one.
+
+    Attributes
+    ----------
+    num_simulations:
+        Simulations per search.  Deliberately small by default: quality versus
+        cost is measured later, so start around 32-50 rather than hundreds.
+    discount:
+        Discount factor used for backup and PUCT.  Use the same value intended
+        for MuZero training.
+    pb_c_base / pb_c_init:
+        Constants of the standard MuZero PUCT exploration term.
+    root_dirichlet_alpha / root_exploration_fraction:
+        Root Dirichlet noise ``P' = (1 - f) P + f * Dirichlet(alpha)``.
+    add_root_noise:
+        Default for whether a search adds root noise.  Leave ``False`` for
+        deterministic validation/evaluation; enable for training search.
+    temperature:
+        Visit-count policy temperature.  ``0.0`` (or <= 1e-8) means deterministic
+        argmax over visit counts.
+    seed:
+        Seed for the search's own RNG (root noise only).  Deterministic
+        evaluation does not consume it.
+    normalize_values:
+        Use :class:`forexmind.muzero.minmax.MinMaxStats` to normalize backed-up
+        Q values before they are added to the PUCT prior term.
+    """
+
+    num_simulations: int = 50
+    discount: float = 0.99
+    pb_c_base: float = 19652.0
+    pb_c_init: float = 1.25
+    root_dirichlet_alpha: float = 0.3
+    root_exploration_fraction: float = 0.25
+    add_root_noise: bool = False
+    temperature: float = 0.0
+    seed: int = 0
+    normalize_values: bool = True
+
+    def __post_init__(self) -> None:
+        if self.num_simulations < 1:
+            raise ValueError(f"num_simulations must be >= 1, got {self.num_simulations}")
+        if not 0.0 < self.discount <= 1.0:
+            raise ValueError(f"discount must be in (0, 1], got {self.discount}")
+        if self.pb_c_base <= 0.0:
+            raise ValueError(f"pb_c_base must be > 0, got {self.pb_c_base}")
+        if self.pb_c_init < 0.0:
+            raise ValueError(f"pb_c_init must be >= 0, got {self.pb_c_init}")
+        if self.root_dirichlet_alpha <= 0.0:
+            raise ValueError(f"root_dirichlet_alpha must be > 0, got {self.root_dirichlet_alpha}")
+        if not 0.0 <= self.root_exploration_fraction <= 1.0:
+            raise ValueError(
+                f"root_exploration_fraction must be in [0, 1], got {self.root_exploration_fraction}"
+            )
+        if self.temperature < 0.0:
+            raise ValueError(f"temperature must be >= 0, got {self.temperature}")
+
+    def training(self) -> SearchConfig:
+        """Return a copy with root Dirichlet noise enabled (training search)."""
+        return replace(self, add_root_noise=True)
+
+    def evaluation(self) -> SearchConfig:
+        """Return a copy with root noise disabled and greedy visit selection."""
+        return replace(self, add_root_noise=False, temperature=0.0)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

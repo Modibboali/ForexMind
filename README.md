@@ -299,37 +299,56 @@ selection remain unchanged.
 python -m tools.audit_ppo_evaluation --checkpoint forexmind/best.pt --split validation --episodes 100 --seed 42
 ```
 
-### MuZero core networks (Stage 4.1)
+### MuZero latent planning (Stages 4.1-4.2)
 
-`forexmind/muzero/` implements only the MuZero neural architecture and its
-inference contracts — representation `h_theta`, dynamics `g_theta`, and
-prediction `f_theta`. There is no MCTS, replay, self-play, MuZero loss, or
-training loop yet, and `recurrent_inference` is a pure neural latent transition
-that never calls `env.step()`.
+`forexmind/muzero/` implements the MuZero neural architecture (representation
+`h_theta`, dynamics `g_theta`, prediction `f_theta`) and the MCTS/PUCT search
+layer that plans in the learned latent space. `recurrent_inference` is a pure
+neural latent transition that never calls `env.step()`. There is still no
+replay, self-play, MuZero loss, or training loop.
+
+MuZero uses its own frozen **six-action** space — `HOLD`, `FLAT`, `SHORT_100`,
+`SHORT_50`, `LONG_50`, `LONG_100` — projected onto the shared ten-action
+environment through `project_action_mask`; the environment, PPO, and the
+evaluator are unchanged. Imagined action masks come from a deterministic
+`PlanningState`, not from the network.
 
 ```python
-from forexmind.muzero import MuZeroConfig, build_muzero_network
+from forexmind.muzero import MuZeroConfig, MuZeroMCTS, SearchConfig, build_muzero_network
 
 config = MuZeroConfig.from_encoder_config()   # obs_dim derived from the encoder (351)
-model = build_muzero_network(config)          # 540,372 parameters at the defaults
+model = build_muzero_network(config)          # 539,280 parameters at the defaults
 
 root = model.initial_inference(observation, action_mask)
 child = model.recurrent_inference(root.latent_state, action, next_mask)
+
+search = MuZeroMCTS(model, SearchConfig(num_simulations=50).evaluation())
+result = search.search_from_env(env, observation)
+result.action, result.policy, result.visit_counts
 ```
 
-Both methods share one `NetworkOutput` (`latent_state`, `policy_logits`,
-`value`, `reward`, plus optional `value_logits` / `reward_logits`). The action
-space is the existing 10-way categorical Forex system, actions are embedded
-before entering the dynamics network, and action masks are applied in the
-inference layer so invalid actions get an effective zero prior while HOLD stays
-valid. Reward/value use configurable categorical-support heads
-(`use_support=False` switches to scalar heads without changing the API). See
-[Stage 4.1 report](docs/stage41_muzero_networks.md) for shapes, tests, and the
-inference throughput baseline.
+Both inference calls share one `NetworkOutput` (`latent_state`,
+`policy_logits`, `value`, `reward`, plus optional `value_logits` /
+`reward_logits`); actions are embedded before entering the dynamics network and
+masks are applied in the inference layer, so invalid actions get an effective
+zero prior while HOLD stays valid. Reward/value use configurable
+categorical-support heads (`use_support=False` switches to scalar heads without
+changing the API).
+
+Search returns a `SearchResult` with visit counts, the visit-count policy,
+root value/priors, the root action mask, and diagnostics (depth, expanded
+nodes, recurrent calls, per-action `Q`, PUCT scores). Root Dirichlet noise is
+off by default and enabled via `SearchConfig.training()`.
 
 ```powershell
 python -m tools.benchmark_muzero_inference --batch-sizes 1 16 64 256
+python -m tools.benchmark_muzero_search --simulations 16 32 64 128
 ```
+
+See [Stage 4.1 report](docs/stage41_muzero_networks.md) for the network shapes
+and inference throughput, and
+[Stage 4.2 report](docs/stage42_muzero_search.md) for the search architecture,
+PUCT equation, backup semantics, masking, tests, and search-cost curve.
 
 ---
 ## 8. Reward

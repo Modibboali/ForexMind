@@ -12,6 +12,14 @@ Nothing in the frozen Forex contract changed: observation semantics, reward
 currency conversion, episode mechanics, categorical actions, and validation
 splits are untouched.
 
+> **Stage 4.2 update.** MuZero was subsequently retargeted to its own frozen
+> **six-action** space (`HOLD`, `FLAT`, `SHORT_100`, `SHORT_50`, `LONG_50`,
+> `LONG_100`) while the shared ten-action environment stayed untouched. Every
+> `num_actions`-dependent number below (policy width, parameter count, inference
+> benchmark) has been refreshed for the six-action model; the network code
+> itself is unchanged because `num_actions` was always a parameter. See
+> [Stage 4.2 report](stage42_muzero_search.md) for the search layer.
+
 ---
 
 ## 1. Repository structure inspected
@@ -60,8 +68,8 @@ Forex, training, or evaluation module was modified.
 observation
     ↓  h_theta  RepresentationNetwork : Linear→LayerNorm→SiLU (x2) → Linear → LayerNorm
 latent state s_t^0  [B, latent_dim]
-    ↓  f_theta  PredictionNetwork : policy trunk → 10 logits ; value trunk → value head
-policy logits [B, 10] , value [B, 1]
+    ↓  f_theta  PredictionNetwork : policy trunk → 6 logits ; value trunk → value head
+policy logits [B, 6] , value [B, 1]
 
 latent state s + action index
     ↓  nn.Embedding(num_actions, action_embedding_dim)
@@ -119,6 +127,7 @@ latent features), never across unrelated batch samples.
 
 | Setting | Value |
 |---|---|
+| `num_actions` | 6 (MuZero space, see Stage 4.2) |
 | `hidden_dim` | 256 |
 | `num_layers` | 2 hidden blocks per sub-network |
 | `action_embedding_dim` | 16 |
@@ -156,9 +165,11 @@ no dynamics transition has occurred.
 | Component | Parameters |
 |---|---:|
 | Representation | 190,080 |
-| Dynamics | 142,645 |
-| Prediction | 207,647 |
-| **Total** | **540,372** |
+| Dynamics | 142,581 |
+| Prediction | 206,619 |
+| **Total** | **539,280** |
+
+(Six-action model. The ten-action model measured 540,372.)
 
 ## 9. Initial inference example
 
@@ -167,31 +178,31 @@ no dynamics transition has occurred.
 ```
 observation     (4, 351)
 latent_state    (4, 128)
-policy_logits   (4, 10)
+policy_logits   (4, 6)
 value           (4, 1)
 reward          (4, 1)      # exactly 0
 value_logits    (4, 21)
 reward_logits   None
 ```
 
-`[B, 351] → [B, 128] → [B, 10] / [B, 1]`. A single observation of shape
+`[B, 351] → [B, 128] → [B, 6] / [B, 1]`. A single observation of shape
 `(351,)` is accepted and treated as `B = 1`; NumPy `float32` arrays are accepted.
 
 ## 10. Recurrent inference example
 
 `recurrent_inference(latent_state, action, action_mask=None)` with `B = 4` and
-actions `[0, 3, 7, 9]`:
+actions `[0, 3, 4, 5]`:
 
 ```
 latent_state    (4, 128)    # the NEXT latent state
-policy_logits   (4, 10)
+policy_logits   (4, 6)
 value           (4, 1)
 reward          (4, 1)
 value_logits    (4, 21)
 reward_logits   (4, 21)
 ```
 
-`action` is the discrete index `0…9` (not target exposure); a Python int is
+`action` is the discrete index `0…5` (not target exposure); a Python int is
 broadcast across the batch, a tensor must be `[B]` (or `[1]`). The returned
 `latent_state` is the successor so MCTS can chain calls. This path is a pure
 neural transition and never calls `env.step()`.
@@ -206,29 +217,29 @@ by passing `action_mask=None`.
   probability is exactly `0.0`.
 - `HOLD` (index 0) must remain valid, and every batch row must keep at least one
   valid action — both enforced with clear `ValueError`s.
-- Requirement `mask.shape == [B, 10]`; a 1-D `[10]` mask is broadcast.
+- Requirement `mask.shape == [B, num_actions]`; a 1-D mask is broadcast.
 - The mask is not applied in place (`test_apply_action_mask_is_pure_function`).
 
-Using the frozen environment mask (`valid_action_mask`):
+Using the frozen environment mask (`valid_action_mask`), projected onto MuZero's
+six actions:
 
 ```
-flat account        -> FLAT masked (other 9 valid)
+flat account        -> FLAT masked (other 5 valid)
 exposure = +0.50    -> LONG_50 masked
-masked probability of LONG_50 = 0.0 ; HOLD probability = 0.400987
+masked probability of LONG_50 = 0.0 ; HOLD prior = 0.1965 (32-sim search)
 ```
 
 ## 12. Unit-test results
 
-New tests: **74 passed, 1 skipped** (CUDA-only test skipped on this CPU box).
+New tests: **70 passed, 1 skipped** (CUDA-only test skipped on this CPU box).
 
 | Area | Coverage |
 |---|---|
 | Representation | shape/finite for B=1,4,32; wrong-obs-dim rejection |
-| Initial inference | `reward == 0`; `[B,10]` policy; finite value/latent; 1-D and NumPy inputs |
-| Recurrent inference | all 10 actions finite; per-batch actions; pure-neural call on a synthetic latent |
-| Action encoding | 10 distinct embeddings; `-1/10/11/100` raise; element-wise range check; float rejection |
-| Determinism | identical outputs across repeated calls; no sampling inside the network |
-| Masking | zero invalid probability; HOLD always valid; ≥1 valid action; shape/`[10]` broadcast; purity |
+| Initial inference | `reward == 0`; `[B,6]` policy; finite value/latent; 1-D and NumPy inputs |
+| Recurrent inference | all 6 actions finite; per-batch actions; pure-neural call on a synthetic latent |
+| Action encoding | 6 distinct embeddings; out-of-range indices raise; element-wise range check; float rejection |
+| Masking | zero invalid probability; HOLD always valid; ≥1 valid action; shape/broadcast; purity |
 | Gradients | synthetic policy+value+reward loss → every parameter finite grad, no NaN/Inf; reward-head gradient |
 | Batch/device | B=1,4,32; outputs stay on the model device; CUDA test gated on availability |
 | Unroll | 5-step stability, divergence between action sequences, order sensitivity |
@@ -236,8 +247,9 @@ New tests: **74 passed, 1 skipped** (CUDA-only test skipped on this CPU box).
 | `NetworkOutput` | shape validation for `value`, `policy_logits`, `value_logits` |
 | Support | distribution validity, endpoints, centre bin, clamping, round-trips, validation |
 
-Full repository suite after the change: **511 passed, 2 skipped**.
-`ruff check`, `ruff format --check`, and `mypy` (100 files) are clean.
+Full repository suite after the change: **511 passed, 2 skipped** (Stage 4.1);
+**586 passed, 2 skipped** after Stage 4.2.
+`ruff check`, `ruff format --check`, and `mypy` (105 files) are clean.
 
 ## 13. Five-step latent unroll result
 
@@ -245,15 +257,15 @@ Full repository suite after the change: **511 passed, 2 skipped**.
 o_t → initial_inference → s0
     → a0=0 → recurrent_inference → s1
     → a1=3 → recurrent_inference → s2
-    → a2=7 → recurrent_inference → s3
-    → a3=9 → recurrent_inference → s4
-    → a4=4 → recurrent_inference → s5
+    → a2=4 → recurrent_inference → s3
+    → a3=5 → recurrent_inference → s4
+    → a4=2 → recurrent_inference → s5
 ```
 
 With `B = 2`: six latent states (one initial + five recurrent), each `(2, 128)`;
 latent, policy, value, and reward stay finite at every step; no NaN/Inf appears.
-For the same root latent, `[2,2,2,2,2]` and `[9,9,9,9,9]` converge to different
-final latents, and `[1,8]` differs from `[8,1]`, so actions genuinely affect the
+For the same root latent, `[2,2,2,2,2]` and `[5,5,5,5,5]` converge to different
+final latents, and `[1,5]` differs from `[5,1]`, so actions genuinely affect the
 transition.
 
 ## 14. Inference throughput benchmark
@@ -263,13 +275,13 @@ transition.
 
 | Batch | initial calls/s | initial states/s | recurrent calls/s | recurrent states/s |
 |---:|---:|---:|---:|---:|
-| 1 | 355.6 | 355.6 | 285.7 | 285.7 |
-| 16 | 309.0 | 4,944.0 | 221.3 | 3,541.4 |
-| 64 | 212.8 | 13,616.6 | 179.3 | 11,478.3 |
-| 256 | 124.6 | 31,887.2 | 112.1 | 28,698.0 |
+| 1 | 343.7 | 343.7 | 247.7 | 247.7 |
+| 16 | 256.3 | 4,101.0 | 226.9 | 3,630.8 |
+| 64 | 203.6 | 13,027.9 | 171.7 | 10,987.3 |
+| 256 | 119.5 | 30,603.7 | 107.7 | 27,581.6 |
 
 `recurrent_inference` is the MCTS-critical call; at batch 64 it sustains
-~11.5k states/s (~15.5k latent-expansions/min) on this machine single-threaded.
+~11.0k states/s (~15.5k latent-expansions/min) on this machine single-threaded.
 Run-to-run spread on this shared box is roughly 1.6×, so treat these as a
 baseline order of magnitude, not a precise rating. Results are written to
 `data/reports/stage41_muzero_inference_benchmark.json`. No optimization was
@@ -303,7 +315,7 @@ child = model.recurrent_inference(root.latent_state, action, next_mask)
 ```
 
 - One shared `NetworkOutput` type, one batched code path (B = 1 and B > 1),
-  action indices aligned with the frozen 10-way categorical system.
+  action indices aligned with MuZero's frozen six-action space (Stage 4.2).
 - `recurrent_inference` is a pure neural latent transition — it never calls the
   environment, so latent planning cannot leak real transitions.
 - Raw logits are returned and masking lives in the inference layer, which is
