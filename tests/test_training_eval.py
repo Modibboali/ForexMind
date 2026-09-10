@@ -58,11 +58,15 @@ def _policy() -> SquashedGaussianActor:
 
 
 def test_selection_score_default() -> None:
-    m = {"sharpe": 1.5, "max_drawdown_pct": 0.1}
-    assert selection_score(m, "sharpe_drawdown", 1.0) == pytest.approx(1.5 - 1.0 * 0.1)
-    assert selection_score(m, "sharpe_drawdown", 2.0) == pytest.approx(1.5 - 2.0 * 0.1)
-    assert selection_score(m, "sharpe") == pytest.approx(1.5)
-    assert selection_score(m, "total_return") == pytest.approx(0.0)
+    m = {"mean_episode_log_return": 0.015, "mean_episode_return": 0.02}
+    assert selection_score(m) == pytest.approx(0.015)
+    assert selection_score(m, "mean_episode_return") == pytest.approx(0.02)
+
+
+@pytest.mark.parametrize("metric", ["sharpe", "sharpe_drawdown", "total_return"])
+def test_selection_score_rejects_legacy_synthetic_metrics(metric: str) -> None:
+    with pytest.raises(ValueError, match="legacy selection metric"):
+        selection_score({metric: 99.0}, metric)
 
 
 def test_selection_score_unknown_metric_raises() -> None:
@@ -107,15 +111,19 @@ def test_policy_evaluator_returns_metrics() -> None:
     result = evaluator.evaluate(_policy(), "sac", "validation", 2, seed=42)
     assert result.split == "validation"
     for key in (
-        "total_return",
-        "sharpe",
-        "sortino",
-        "max_drawdown_pct",
+        "mean_episode_log_return",
+        "mean_episode_return",
+        "median_episode_return",
+        "profitable_episode_fraction",
         "_selection_score",
-        "turnover",
-        "mean_reward",
+        "mean_turnover_per_episode",
+        "cross_episode_mean_return_series",
     ):
         assert key in result.metrics
+    assert result.metrics["total_return"] is None
+    assert result.metrics["sharpe"] is None
+    assert result.metrics["portfolio_sharpe"] is None
+    assert result.metrics["is_portfolio_path"] is False
     assert np.isfinite(result.score)
 
 
@@ -135,7 +143,9 @@ def test_policy_evaluator_deterministic_across_runs() -> None:
     r1 = evaluator.evaluate(policy, "sac", "validation", 2, seed=42)
     r2 = evaluator.evaluate(policy, "sac", "validation", 2, seed=42)
     assert r1.score == pytest.approx(r2.score)
-    assert r1.metrics["total_return"] == pytest.approx(r2.metrics["total_return"])
+    assert r1.metrics["mean_episode_log_return"] == pytest.approx(
+        r2.metrics["mean_episode_log_return"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -165,8 +175,14 @@ def test_benchmark_test_split_compares_all_agents() -> None:
     assert expected <= set(agents)
     assert len(bench["results"]) == 8
     for r in bench["results"]:
-        assert "sharpe" in r["metrics"]
-        assert r["per_year"]  # per-year table is populated
+        assert r["metrics"]["sharpe"] is None
+        assert r["metrics"]["total_return"] is None
+        assert r["metrics"]["mean_episode_return"] is not None
+        diagnostic = r["metrics"]["cross_episode_mean_return_series"]
+        assert diagnostic["is_portfolio"] is False
+        assert "diagnostic_sharpe" in diagnostic
+        assert r["per_year"] == {}
+        assert "capital paths" in r["per_year_unavailable_reason"]
 
 
 def test_write_benchmark_results_files(tmp_path) -> None:
@@ -195,7 +211,7 @@ def test_write_benchmark_results_files(tmp_path) -> None:
     assert "sac_trained" in text
     assert "flat" in text
     csv_text = paths["agent"].read_text(encoding="utf-8")
-    assert "agent" in csv_text and "sharpe" in csv_text
+    assert "agent" in csv_text and "mean_episode_return" in csv_text
 
 
 def test_load_checkpoint_policy_roundtrip(tmp_path) -> None:
@@ -242,40 +258,16 @@ def test_load_checkpoint_policy_roundtrip_ppo(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Turnover metric (execution_price is a str in the trade log)
+# Numeric checkpoint/report coercion
 # ---------------------------------------------------------------------------
 
 
-def test_pooled_turnover_coerces_string_price() -> None:
-    """execution_price is stored as a str; turnover must still be computed."""
-    from forexmind.training.evaluator import _f, _pooled_turnover
+def test_report_float_coercion_accepts_numeric_strings() -> None:
+    from forexmind.training.evaluator import _f
 
     assert _f("1.20088") == pytest.approx(1.20088)
     assert _f("not-a-number", default=0.0) == 0.0
     assert _f(1.25) == pytest.approx(1.25)
-
-    class _Traj:
-        def __init__(self, trade_log):
-            self.info = {"initial_balance": 10000.0}
-            self.trade_log = trade_log
-
-    class _Ev:
-        def __init__(self, trajs):
-            self.trajectories_by_instrument = {"EURUSD": trajs}
-
-    ev = _Ev(
-        [
-            _Traj(
-                [
-                    {"units_delta": -1725.7325883395993, "execution_price": "1.20088"},
-                    {"units_delta": 6603.40551283013, "execution_price": "1.20055"},
-                ]
-            )
-        ]
-    )
-    turnover = _pooled_turnover(ev)
-    assert turnover > 0.0  # was 0.0 before the _f string-coercion fix
-
 
 # ---------------------------------------------------------------------------
 # Checkpoint discovery (forgiving --checkpoint resolution)

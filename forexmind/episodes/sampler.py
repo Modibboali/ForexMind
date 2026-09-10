@@ -152,6 +152,74 @@ class EpisodeSampler:
             )
         return specs
 
+    def sample_non_overlapping(
+        self,
+        n: int,
+        *,
+        seed: int | None = None,
+        instruments: list[str] | tuple[str, ...] | None = None,
+        split: str | None = None,
+    ) -> list[EpisodeSpec]:
+        """Sample a deterministic, balanced set with disjoint observed windows.
+
+        Disjointness includes both the context preceding a decision start and
+        the full episode horizon. This prevents duplicated observations within
+        an instrument; different instruments remain separate market paths.
+        """
+        if n <= 0:
+            raise ValueError("n must be positive")
+        split = split or self.config.split
+        seed = self.config.seed if seed is None else seed
+        rng = np.random.default_rng(seed)
+        source = instruments if instruments is not None else self.dataset.instruments
+        instrs = [str(instrument).upper() for instrument in source]
+        if not instrs:
+            raise ValueError("no instruments available for sampling")
+
+        order = (instrs * ((n + len(instrs) - 1) // len(instrs)))[:n]
+        rng.shuffle(order)
+        needed = {instr: order.count(instr) for instr in instrs}
+        chosen_starts: dict[str, list[int]] = {instr: [] for instr in instrs}
+        context = self.config.context_length
+        horizon = self.config.horizon
+
+        for instr in instrs:
+            candidates = self.valid_starts(instr, split).copy()
+            rng.shuffle(candidates)
+            occupied: list[tuple[int, int]] = []
+            for raw_start in candidates:
+                start = int(raw_start)
+                observed = (start - context + 1, start + horizon)
+                if any(observed[0] <= end and begin <= observed[1] for begin, end in occupied):
+                    continue
+                chosen_starts[instr].append(start)
+                occupied.append(observed)
+                if len(chosen_starts[instr]) == needed[instr]:
+                    break
+            if len(chosen_starts[instr]) != needed[instr]:
+                raise RuntimeError(
+                    f"cannot place {needed[instr]} non-overlapping episodes for "
+                    f"{instr}/{split}; placed {len(chosen_starts[instr])}"
+                )
+
+        offsets = {instr: 0 for instr in instrs}
+        specs: list[EpisodeSpec] = []
+        for k, instr in enumerate(order):
+            start = chosen_starts[instr][offsets[instr]]
+            offsets[instr] += 1
+            specs.append(
+                EpisodeSpec(
+                    instrument=instr,
+                    split=split,
+                    start_index=start,
+                    end_index=start + horizon,
+                    horizon=horizon,
+                    context_length=context,
+                    seed=seed + k,
+                )
+            )
+        return specs
+
     def explicit(
         self,
         instrument: str,

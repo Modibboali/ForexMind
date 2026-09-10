@@ -283,7 +283,11 @@ def run_final_benchmark(checkpoint: str, episodes: int, out: str | None) -> None
         load_checkpoint_policy,
         write_benchmark_results,
     )
-    from forexmind.training.evaluator import PolicyEvaluator
+    from forexmind.training.evaluator import (
+        DEFAULT_SELECTION_METRIC,
+        VALID_SELECTION_METRICS,
+        PolicyEvaluator,
+    )
 
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     algorithm = state.get("algorithm", "sac")
@@ -296,12 +300,18 @@ def run_final_benchmark(checkpoint: str, episodes: int, out: str | None) -> None
         checkpoint, encoder.config.spec.encoded_shape[0], config.model
     )
 
+    checkpoint_metric = state.get("selection_metric_name")
+    selection_metric = (
+        str(checkpoint_metric)
+        if checkpoint_metric in VALID_SELECTION_METRICS
+        else DEFAULT_SELECTION_METRIC
+    )
     evaluator = PolicyEvaluator(
         dataset,
         env_config,
         encoder,
         window_config,
-        selection_metric=config.selection.metric,
+        selection_metric=selection_metric,
         lambda_drawdown=config.selection.lambda_drawdown,
         eval_horizon=config.evaluation.eval_horizon,
         eval_seed=config.evaluation.eval_seed,
@@ -334,11 +344,11 @@ def run_final_benchmark(checkpoint: str, episodes: int, out: str | None) -> None
     for row in bench["results"]:
         metrics = row["metrics"]
         print(
-            f"  {row['agent']:<16} ret={metrics.get('total_return', 0):+.4f}  "
-            f"sharpe={metrics.get('sharpe', 0):+.4f}  "
-            f"sortino={metrics.get('sortino', 0):+.4f}  "
-            f"mdd={metrics.get('max_drawdown_pct', 0):.4f}  "
-            f"turnover={metrics.get('turnover', 0):.4f}"
+            f"  {row['agent']:<16} mean_episode_return="
+            f"{metrics['mean_episode_return']:+.4f}  "
+            f"median_episode_return={metrics['median_episode_return']:+.4f}  "
+            f"profitable={metrics['profitable_episode_fraction']:.1%}  "
+            f"mean_turnover={metrics['mean_turnover_per_episode']:.4f}"
         )
 
 

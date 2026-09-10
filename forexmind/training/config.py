@@ -114,8 +114,9 @@ class EvalConfig:
 
 @dataclass
 class SelectionConfig:
-    metric: str = "sharpe_drawdown"  # "sharpe" | "sharpe_drawdown" | "total_return"
-    lambda_drawdown: float = 1.0  # Score = Sharpe - lambda * max_drawdown_pct
+    metric: str = "mean_episode_log_return"
+    # Retained for loading old configuration files; unused by valid selectors.
+    lambda_drawdown: float = 1.0
 
 
 @dataclass

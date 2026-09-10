@@ -59,7 +59,7 @@ evaluation:
   eval_horizon: 16
   eval_seed: 42
 selection:
-  metric: sharpe_drawdown
+  metric: mean_episode_log_return
   lambda_drawdown: 1.0
 run_id: ''
 dataset_version: processed-parquet-2026

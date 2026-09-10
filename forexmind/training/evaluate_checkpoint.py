@@ -13,6 +13,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -29,9 +30,13 @@ from forexmind.training.config import ExperimentConfig
 from forexmind.training.data import (
     DEFAULT_INSTRUMENT_ORDER,
     DEFAULT_PROCESSED_DIR,
-    make_training_dataset,
 )
-from forexmind.training.evaluator import PolicyEvaluator
+from forexmind.training.dataset_mmap import resolve_dataset
+from forexmind.training.evaluator import (
+    DEFAULT_SELECTION_METRIC,
+    VALID_SELECTION_METRICS,
+    PolicyEvaluator,
+)
 from forexmind.training.trainer import build_env_config
 
 
@@ -111,7 +116,9 @@ def main() -> None:
         if config.environment.instruments
         else DEFAULT_INSTRUMENT_ORDER
     )
-    dataset = make_training_dataset(DEFAULT_PROCESSED_DIR, None, instruments)
+    dataset, _backend = resolve_dataset(
+        processed_dir=DEFAULT_PROCESSED_DIR, instruments=instruments, backend="auto"
+    )
     env_config = build_env_config(config.environment)
     encoder = ObservationEncoder(
         EncoderConfig(
@@ -125,23 +132,41 @@ def main() -> None:
     )
     print(f"Loaded checkpoint: {checkpoint}")
 
+    checkpoint_metric = state.get("selection_metric_name")
+    selection_metric = (
+        str(checkpoint_metric)
+        if checkpoint_metric in VALID_SELECTION_METRICS
+        else DEFAULT_SELECTION_METRIC
+    )
     evaluator = PolicyEvaluator(
         dataset,
         env_config,
         encoder,
         window_config,
-        selection_metric=config.selection.metric,
+        selection_metric=selection_metric,
         lambda_drawdown=config.selection.lambda_drawdown,
         eval_horizon=config.evaluation.eval_horizon,
         eval_seed=args.seed if args.seed is not None else config.evaluation.eval_seed,
         context_length=config.environment.context_length,
     )
-    result = evaluator.evaluate(policy, algorithm, args.split, args.episodes)
+    result = evaluator.evaluate_sampled(policy, algorithm, args.split, args.episodes)
     print(f"\n=== {algorithm.upper()} frozen policy on {args.split} ({args.episodes} episodes) ===")
-    for k, v in sorted(result.metrics.items()):
-        print(f"  {k:<22} {v}")
+    for k, v in sorted(result.items()):
+        if not isinstance(v, (dict, list)):
+            print(f"  {k:<22} {v}")
+    print("  Portfolio Sharpe/Sortino unavailable: independently reset sampled episodes.")
+    out = Path(args.out) if args.out else checkpoint.resolve().parent / "evaluation" / args.split
+    out.mkdir(parents=True, exist_ok=True)
+    report_path = out / "sampled_evaluation.json"
+    report_path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    print(f"  Per-episode distributions and diagnostics: {report_path}")
 
     if args.benchmark:
+        print(
+            "Benchmark reports independent episode distributions. The old step-aligned "
+            "curve is retained only as a named diagnostic. Use tools.audit_ppo_evaluation "
+            "for matched enter-and-HOLD comparisons."
+        )
         bench = benchmark_test_split(
             dataset=dataset,
             env_config=env_config,

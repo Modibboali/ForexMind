@@ -11,9 +11,24 @@ from forexmind.training.config import ExperimentConfig
 
 
 def _volatile_dataset():
+    import pandas as pd
+
     from tests.synthetic import m5_mean_reverting, make_instrument, make_split_dataset
 
-    m5 = m5_mean_reverting("2020-01-06", n=2400, mean=1.10, amplitude=0.01, period=50)
+    m5 = pd.concat(
+        [
+            m5_mean_reverting(
+                "2020-01-06", n=2400, mean=1.10, amplitude=0.01, period=50
+            ),
+            m5_mean_reverting(
+                "2021-03-01", n=80, mean=1.10, amplitude=0.01, period=50
+            ),
+            m5_mean_reverting(
+                "2022-03-01", n=80, mean=1.10, amplitude=0.01, period=50
+            ),
+        ],
+        ignore_index=True,
+    )
     return make_split_dataset({"EURUSD": make_instrument("EURUSD", m5)})
 
 
@@ -49,7 +64,7 @@ def test_same_seed_same_run(tmp_path) -> None:
     assert lc1 == lc2
     assert s1["env_steps"] == s2["env_steps"] == 256
     assert s1["gradient_updates"] == s2["gradient_updates"]
-    assert s1["best_validation_score"] == s2["best_validation_score"]
+    assert s1["best_selection_score"] == s2["best_selection_score"]
 
 
 def test_different_seeds_differ(tmp_path) -> None:

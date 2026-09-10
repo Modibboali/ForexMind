@@ -87,10 +87,13 @@ class EvaluationRunner:
         env_config: EnvironmentConfig,
         encoder: ObservationEncoder,
         window_config: WindowConfig | None = None,
+        *,
+        capture_account_state: bool = False,
     ) -> None:
         self.dataset = dataset
         self.env_config = env_config
         self.encoder = encoder
+        self.capture_account_state = capture_account_state
         self.window_config = window_config or WindowConfig(
             context_length=encoder.config.context_length
         )
@@ -138,6 +141,8 @@ class EvaluationRunner:
         )
         initial_equity = _to_float(info["equity"])
         initial_balance = float(self.env_config.margin.initial_balance)
+        initial_timestamp = str(obs.timestamp)
+        account_history: list[dict[str, float]] = []
 
         timestamps: list[np.datetime64] = []
         actions: list[float] = []
@@ -157,6 +162,21 @@ class EvaluationRunner:
                 agent.set_action_mask(env.action_masks())
             action = agent.act(encoded)
             obs, reward, terminated, truncated, info = env.step(action)
+            if self.capture_account_state:
+                account = obs.account
+                units = float(account.position_units)
+                eq = float(account.equity)
+                account_history.append(
+                    {
+                        "exposure_fraction": (
+                            math.copysign(float(account.gross_exposure) / eq, units)
+                            if units and eq > 0
+                            else 0.0
+                        ),
+                        "unrealized_pnl": float(account.unrealized_pnl),
+                        "balance": float(account.balance),
+                    }
+                )
             action_index = getattr(agent, "last_action_index", None)
             if action_index is not None:
                 action_indices.append(action_index)
@@ -236,6 +256,15 @@ class EvaluationRunner:
             },
         )
         periods = self.periods_per_year(spec.split)
+        if self.capture_account_state:
+            traj.info.update(
+                initial_timestamp=initial_timestamp,
+                account_history=account_history,
+                terminal_equity_includes_unrealized_pnl=True,
+                terminal_liquidation_requested=self.env_config.close_at_episode_end,
+                terminated=terminated,
+                truncated=truncated,
+            )
         traj.metrics = compute_metrics(
             equity=traj.equity,
             log_returns=traj.log_returns,

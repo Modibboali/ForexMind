@@ -80,9 +80,9 @@ def _ppo_action_statistics(trajectories: list[Any]) -> dict[str, Any]:
     if trajectories and all(
         t.info.get("action_semantics") == "categorical_v1" for t in trajectories
     ):
-        from forexmind.training.evaluator import _action_diagnostics
+        from forexmind.evaluation.sampled import action_summary
 
-        stats = _action_diagnostics(trajectories)
+        stats = action_summary(trajectories)
         stats["n_trades"] = stats["actual_executions"]
         return stats
     all_actions = []

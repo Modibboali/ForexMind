@@ -287,6 +287,18 @@ episodes. Results include all ten action frequencies, HOLD streaks, position
 durations, executions, reversals, transitions, and turnover. See
 [Stage 3.4 report](docs/stage34_categorical_ppo.md) for results and definitions.
 
+The [PPO evaluation audit](docs/ppo_evaluation_audit.md) corrects standalone
+reporting for randomly sampled episodes. The old 512-step aggregate averages
+unrelated episodes by relative timestep; its Sharpe is a diagnostic rather than
+a portfolio Sharpe. Frozen-checkpoint reports now expose independent episode
+distributions, explicit turnover totals and means, terminal account state, and
+matched enter-once-and-HOLD baselines. Training and historical checkpoint
+selection remain unchanged.
+
+```powershell
+python -m tools.audit_ppo_evaluation --checkpoint forexmind/best.pt --split validation --episodes 100 --seed 42
+```
+
 ---
 ## 8. Reward
 
@@ -586,11 +598,14 @@ instrument.
 - **Annualization**: default `auto` — uses the *actual* number of valid M5
   observations per year in the evaluated split (≈ 73k), configurable.
 
-**Reporting** is per-instrument and per-period, then equal-weighted aggregate
-(so EURUSD's row count does not dominate). Reports are JSON with full
-reproducibility metadata (dataset version, split config, env / execution /
-reward / episode / agent config, seeds, project version) plus a human-readable
-summary. Random baselines are aggregated across seeds.
+**Reporting** treats randomly sampled, independently reset accounts as an
+episode distribution. It reports mean/median/std/percentiles, profitability,
+turnover totals and per-episode summaries, plus per-instrument distributions.
+A single portfolio return, Sharpe, Sortino, and calendar-period report remain
+unavailable unless the input is one real chronological capital path. The old
+equal-instrument, relative-timestep average remains available only as the named
+`cross_episode_mean_return_series` diagnostic. Reports include reproducibility
+metadata such as split, episode specs, seeds, and execution configuration.
 
 ## 18. Leakage policy
 
@@ -632,8 +647,9 @@ tests/                         # +65 Phase 2 tests (177 total)
 
 - Baselines use only the causal observation window; SMA/mean-reversion lookbacks
   must be ≤ `context_length` (defaults are).
-- Equal-weighted aggregation aligns episodes by step index (all benchmarks use
-  a common horizon).
+- The historical equal-instrument aggregation aligns episodes by relative step
+  index and is retained only as `cross_episode_mean_return_series` with
+  `diagnostic_only=true`; it is never a portfolio result or selection metric.
 - Per-period drawdown is within-period (resets at each period start).
 - `periods_per_year` is estimated from the split's M5 count; it is an
   approximation of the annualization factor and is stored in every report.
@@ -650,7 +666,8 @@ Dreamer, or a world model — those remain future phases.
 
 Goals:
 
-- Continuous **target-exposure** actions in $[-1, 1]$ (long/flat/short).
+- Continuous **target-exposure** actions in $[-1, 1]$ for SAC; PPO uses the
+  masked categorical HOLD/FLAT and quarter-exposure action set.
 - **SAC** with twin critics + target critics and **automatic entropy
   temperature**; **PPO** with a masked categorical policy, clipped objective, and GAE.
 - **Multi-CPU** training: worker processes are independent of the learner and
@@ -659,8 +676,9 @@ Goals:
 - **Meaningful learning units**: `env_steps` and `gradient_updates` are
   tracked **separately**.
 - **Checkpoints with resume**, automatic validation-based checkpoint selection
-  (`Score = Sharpe − λ·MaxDD` default), and a final **test protocol** that
-  freezes the best checkpoint and runs the untouched test split.
+  using mean cumulative episode log return on one saved, fixed,
+  non-overlapping validation set, and a final **test protocol** that freezes
+  the best checkpoint and runs the untouched test split.
 - **Automatic final result tables** (SAC vs. 7 baselines, per-instrument,
   per-year) in JSON/CSV/text.
 - **Multi-seed** support (`--seeds 1 2 3 4 5`) with per-seed run directories.
@@ -669,8 +687,9 @@ Goals:
 
 1. **Train split only** enters the replay buffer / rollouts.
    (`environment.split: train`; the collector is wired to the train range.)
-2. **Validation** is used *only* to select the best checkpoint
-   (`Score = Sharpe − λ·max_drawdown_pct`, default λ = 1.0).
+2. **Validation** is used *only* to select the best checkpoint. Independently
+   reset episodes are scored by `mean_episode_log_return`; sampled-episode
+   synthetic Sharpe is rejected by the selector.
 3. **Test** is evaluated exactly once at the end with the frozen best
    checkpoint — never during training.
 4. Deterministic evaluation: the policy mean, no exploration noise.
@@ -697,6 +716,12 @@ python -m forexmind.training.evaluate_checkpoint --checkpoint sac_cpu_seed42 --r
 # Final benchmark tables (SAC vs 7 baselines on untouched test)
 python -m forexmind.training.evaluate_checkpoint --checkpoint runs/sac_cpu_seed42 --benchmark --out data/reports/benchmark_sac
 
+# Rank every categorical PPO checkpoint on one fixed sampled validation set
+python -m tools.evaluate_checkpoint_curve --checkpoint-dir runs/ppo_run/checkpoints --episodes 100 --seed 42
+
+# Run resumable, real chronological validation per instrument
+python -m tools.evaluate_chronological_checkpoint --checkpoint runs/ppo_run/checkpoints/best.pt
+
 # Worker-throughput sweep for machine sizing
 python -m tools.benchmark_training --workers 1 2 4 8 16
 ```
@@ -709,7 +734,7 @@ Every run directory (e.g. `runs/sac_cpu_seed42/`) contains `checkpoints/` with:
 | ---- | ------------ |
 | `step_0.pt` | at training start (so a run that is interrupted before the first periodic interval still leaves a resumable checkpoint) |
 | `step_<env_steps>.pt` | every `checkpoint_every_env_steps` |
-| `best.pt` | each time validation improves (`Score = Sharpe − λ·MaxDD`), i.e. the checkpoint selected by validation |
+| `best.pt` | each time fixed sampled validation improves on `mean_episode_log_return` |
 | `final.pt` | when a run completes |
 | `rescue_step_<env_steps>.pt` | on interruption (SIGINT/SIGTERM/exception) so the run can be resumed |
 
@@ -724,7 +749,11 @@ list of existing checkpoints if you mistype a path.
 Training shows a live `tqdm` bar with the current / total environment steps, elapsed time, **ETA** and rate (env steps/s), plus live diagnostics in the suffix (gradient updates, recent mean episode return, and SAC `alpha`/`entropy`/`q1` or PPO `entropy`/`actor_loss`). `tqdm` is an optional dependency (install with `pip install tqdm` or `pip install -e .[train]`); if it is missing, training still runs and prints the periodic progress blocks instead.
 
 `ExperimentConfig` is YAML-serializable and is persisted into every run
-directory, checkpoint, and manifest, so runs are reproducible.
+directory, checkpoint, and manifest. Checkpoints also store the selection
+schema, metric, current and historical best scores, best step, validation seed,
+episode count, exact episode specifications, and validation summary. Legacy
+`best_validation_score` values remain labeled as legacy and never become a new
+selection score on resume.
 
 ## 24. Phase 3 project layout (additions)
 

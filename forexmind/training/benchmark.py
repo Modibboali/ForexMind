@@ -4,9 +4,9 @@ After training, freeze the best checkpoint (deterministic policy) and evaluate
 it on the *untouched* test split alongside the seven Phase-2 baselines using
 the identical episode specs and evaluation runner.  Produces:
 
-* an agent-level table (Return / Sharpe / Sortino / MaxDD / Turnover / PnL),
-* a per-instrument table,
-* a per-year table,
+* independent episode-return distributions and turnover summaries,
+* a per-instrument episode-distribution table,
+* the old step-aligned series under an explicit diagnostic name,
 saved as JSON, CSV, and a readable text table.
 """
 
@@ -27,12 +27,8 @@ from forexmind.config import EnvironmentConfig
 from forexmind.data.splits import SplitDataset
 from forexmind.episodes.config import EpisodeConfig
 from forexmind.episodes.sampler import EpisodeSampler, EpisodeSpec
-from forexmind.evaluation.aggregation import (
-    aggregate_across_instruments,
-    per_period_report,
-)
-from forexmind.evaluation.metrics import compute_series_metrics
 from forexmind.evaluation.runner import AgentEvaluation, EvaluationRunner
+from forexmind.evaluation.sampled import sampled_report
 from forexmind.observation.encoder import ObservationEncoder
 from forexmind.observation.window import WindowConfig
 from forexmind.training.policies import PolicyAgent
@@ -48,15 +44,14 @@ BASELINE_AGENTS: tuple[str, ...] = (
 )
 
 _METRIC_COLUMNS = (
-    "total_return",
-    "annualized_return",
-    "sharpe",
-    "sortino",
-    "calmar",
-    "max_drawdown_pct",
-    "annualized_volatility",
-    "turnover",
-    "mean_reward",
+    "mean_episode_return",
+    "median_episode_return",
+    "episode_return_std",
+    "profitable_episode_fraction",
+    "mean_max_drawdown_per_episode",
+    "total_turnover_all_episodes",
+    "mean_turnover_per_episode",
+    "mean_executions_per_episode",
 )
 
 
@@ -100,36 +95,46 @@ def summarize_evaluation(
     evaluation: AgentEvaluation,
     periods_per_year: float,
 ) -> dict[str, Any]:
-    """Aggregate metrics, per-instrument metrics, and per-year metrics."""
+    """Summarize independently reset episodes without inventing a capital path."""
     grouped = evaluation.trajectories_by_instrument
-    _ts, agg_log, per_instrument_series = aggregate_across_instruments(grouped)
-    metrics = compute_series_metrics(agg_log, periods_per_year)
-    metrics["turnover"] = _pooled_turnover(evaluation)
-    metrics["mean_reward"] = _pooled_mean_reward(evaluation)
+    report = sampled_report(_trajs(grouped), periods_per_year)
+    metrics = {
+        key: report[key]
+        for key in (
+            "n_periods",
+            "total_return",
+            "sharpe",
+            "sortino",
+            "mean_episode_return",
+            "median_episode_return",
+            "episode_return_std",
+            "profitable_episode_fraction",
+            "total_turnover_all_episodes",
+            "mean_turnover_per_episode",
+            "mean_executions_per_episode",
+        )
+    }
+    metrics["mean_max_drawdown_per_episode"] = report["episode_statistics"]["max_drawdown"]["mean"]
+    metrics["portfolio_metrics_unavailable_reason"] = report["portfolio_metrics_unavailable_reason"]
+    metrics["cross_episode_mean_return_series"] = report["cross_episode_mean_return_series"]
 
     per_instrument: dict[str, dict[str, object]] = {}
-    for instr, series in per_instrument_series.items():
-        per_instrument[instr] = compute_series_metrics(series, periods_per_year)
-        per_instrument[instr]["turnover"] = _pooled_turnover_for(grouped.get(instr, []))
-
-    # Per-year metrics pooled over all trajectories (reset each year).
-    all_ts = np.concatenate([t.timestamps for t in _trajs(grouped)])
-    all_lr = np.concatenate([t.log_returns for t in _trajs(grouped)])
-    per_year = per_period_report(all_ts, all_lr, periods_per_year)
-
-    per_instrument_year: dict[str, dict[str, dict[str, object]]] = {}
-    for instr, trajs in grouped.items():
-        ts = np.concatenate([t.timestamps for t in trajs])
-        lr = np.concatenate([t.log_returns for t in trajs])
-        per_instrument_year[instr] = per_period_report(ts, lr, periods_per_year)
+    for instrument, stats in report["per_instrument"].items():
+        per_instrument[instrument] = dict(stats)
+        per_instrument[instrument]["mean_max_drawdown_per_episode"] = stats["episode_statistics"][
+            "max_drawdown"
+        ]["mean"]
 
     return {
         "agent": evaluation.agent_name,
         "n_episodes": evaluation.n_episodes(),
         "metrics": _floatify(metrics),
         "per_instrument": _floatify(per_instrument),
-        "per_year": _floatify(per_year),
-        "per_instrument_year": _floatify(per_instrument_year),
+        "per_year": {},
+        "per_year_unavailable_reason": (
+            "Random account resets do not form chronological yearly capital paths"
+        ),
+        "per_instrument_year": {},
         "wall_seconds": round(evaluation.wall_seconds, 4),
         "steps_per_second": round(evaluation.steps_per_second, 1),
     }
@@ -209,7 +214,9 @@ def benchmark_test_split(
     baseline_agents: tuple[str, ...] = BASELINE_AGENTS,
 ) -> dict[str, Any]:
     """Freeze ``policy`` and compare it against all baselines on ``split``."""
-    runner = EvaluationRunner(dataset, env_config, encoder, window_config)
+    runner = EvaluationRunner(
+        dataset, env_config, encoder, window_config, capture_account_state=True
+    )
     specs = build_test_episode_specs(
         dataset,
         split=split,

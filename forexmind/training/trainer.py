@@ -8,6 +8,7 @@ schedule, and best-checkpoint selection.  Algorithm-specific pieces
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -15,7 +16,7 @@ import time
 from abc import ABC, abstractmethod
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from torch import nn
 from forexmind.config import EnvironmentConfig, default_config
 from forexmind.data.splits import SplitDataset
 from forexmind.episodes.config import EpisodeConfig
+from forexmind.episodes.sampler import EpisodeSampler, EpisodeSpec
 from forexmind.observation.encoder import EncoderConfig, ObservationEncoder
 from forexmind.observation.window import WindowConfig
 from forexmind.training.checkpoint import CheckpointManager
@@ -45,6 +47,8 @@ from forexmind.training.metrics import (
     pathological_warnings,
 )
 from forexmind.training.progress import make_progress_bar
+
+SELECTION_SCHEMA = "sampled_episode_v1"
 
 
 def _to_float(value: object, default: float = 0.0) -> float:
@@ -148,6 +152,31 @@ class BaseTrainer(ABC):
         self._episodes = 0
         self.best_score = -float("inf")
         self.best_checkpoint: str | None = None
+        self.best_checkpoint_step: int | None = None
+        from forexmind.training.evaluator import (
+            DEFAULT_SELECTION_METRIC,
+            LEGACY_SELECTION_METRICS,
+            VALID_SELECTION_METRICS,
+        )
+
+        configured_metric = config.selection.metric
+        self.legacy_selection_metric_name: str | None = None
+        if configured_metric in VALID_SELECTION_METRICS:
+            self.selection_metric_name = configured_metric
+        elif configured_metric in LEGACY_SELECTION_METRICS:
+            self.legacy_selection_metric_name = configured_metric
+            self.selection_metric_name = DEFAULT_SELECTION_METRIC
+            print(
+                f"[selection] legacy metric {configured_metric!r} is disabled; "
+                f"using {self.selection_metric_name!r}",
+                flush=True,
+            )
+        else:
+            raise ValueError(f"unsupported checkpoint selection metric {configured_metric!r}")
+        self.legacy_selection_score: float | None = None
+        self.latest_validation_summary: dict[str, Any] = {}
+        self.validation_episode_specs: list[EpisodeSpec] = []
+        self.legacy_validation_history: list[dict[str, Any]] = []
         self.validation_history: list[dict[str, Any]] = []
         self._start_wall = time.perf_counter()
 
@@ -449,7 +478,12 @@ class BaseTrainer(ABC):
             "gradient_updates": self._gradient_updates,
             "episodes": self._episodes,
             "best_checkpoint": self.best_checkpoint,
-            "best_validation_score": self.best_score,
+            "selection_metric_name": self.selection_metric_name,
+            "best_selection_score": (
+                self.best_score if np.isfinite(self.best_score) else None
+            ),
+            "best_checkpoint_step": self.best_checkpoint_step,
+            "legacy_selection_score": self.legacy_selection_score,
             "warnings": self._collect_warnings(),
         }
         (self.run_dir / "training_summary.json").write_text(
@@ -552,6 +586,123 @@ class BaseTrainer(ABC):
     def _recent_lengths(self, n: int = 200) -> list[int]:
         return self._episode_lengths[-n:] or [0]
 
+    def _validation_specs_path(self) -> Path:
+        return self.run_dir / "validation_episode_specs.json"
+
+    @staticmethod
+    def _spec_from_dict(value: dict[str, Any]) -> EpisodeSpec:
+        return EpisodeSpec(
+            instrument=str(value["instrument"]),
+            split=str(value["split"]),
+            start_index=int(value["start_index"]),
+            end_index=int(value["end_index"]),
+            horizon=int(value["horizon"]),
+            context_length=int(value["context_length"]),
+            seed=int(value["seed"]),
+        )
+
+    def _validate_fixed_specs(self, specs: list[EpisodeSpec]) -> None:
+        expected = self.config.evaluation.validation_episodes
+        if len(specs) != expected:
+            raise ValueError(
+                f"validation specification count {len(specs)} != configured {expected}"
+            )
+        for spec in specs:
+            if (
+                spec.split != "validation"
+                or spec.horizon != self.config.evaluation.eval_horizon
+                or spec.context_length != self.config.environment.context_length
+            ):
+                raise ValueError("saved validation specifications do not match configuration")
+        by_instrument: dict[str, list[EpisodeSpec]] = {}
+        for spec in specs:
+            by_instrument.setdefault(spec.instrument, []).append(spec)
+        for instrument, group in by_instrument.items():
+            for i, left in enumerate(group):
+                left_start = left.start_index - left.context_length + 1
+                for right in group[i + 1 :]:
+                    right_start = right.start_index - right.context_length + 1
+                    if left_start <= right.end_index and right_start <= left.end_index:
+                        raise ValueError(
+                            f"overlapping fixed validation specifications for {instrument}"
+                        )
+
+    def _write_validation_specs(self) -> None:
+        payload = {
+            "evaluation_type": "sampled_independent_episodes",
+            "selection_schema": SELECTION_SCHEMA,
+            "selection_metric_name": self.selection_metric_name,
+            "validation_seed": self.config.evaluation.eval_seed,
+            "validation_episode_count": len(self.validation_episode_specs),
+            "non_overlapping_observation_windows": True,
+            "episode_specs": [spec.to_dict() for spec in self.validation_episode_specs],
+        }
+        self._validation_specs_path().write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+
+    def _fixed_validation_specs(self) -> list[EpisodeSpec]:
+        if self.validation_episode_specs:
+            return self.validation_episode_specs
+        path = self._validation_specs_path()
+        specs: list[EpisodeSpec] | None = None
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                payload.get("selection_schema") == SELECTION_SCHEMA
+                and payload.get("selection_metric_name") == self.selection_metric_name
+                and payload.get("validation_seed") == self.config.evaluation.eval_seed
+            ):
+                specs = [self._spec_from_dict(value) for value in payload["episode_specs"]]
+        if specs is None:
+            config = EpisodeConfig(
+                split="validation",
+                horizon=self.config.evaluation.eval_horizon,
+                context_length=self.config.environment.context_length,
+                seed=self.config.evaluation.eval_seed,
+            )
+            specs = EpisodeSampler(self.dataset, config).sample_non_overlapping(
+                self.config.evaluation.validation_episodes,
+                seed=self.config.evaluation.eval_seed,
+                split="validation",
+            )
+        self._validate_fixed_specs(specs)
+        self.validation_episode_specs = specs
+        self._write_validation_specs()
+        return specs
+
+    def _validation_specs_fingerprint(self) -> str:
+        encoded = json.dumps(
+            [spec.to_dict() for spec in self._fixed_validation_specs()], sort_keys=True
+        ).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _matched_validation_baselines(
+        self, evaluator: Any, policy_evaluation: Any, specs: list[EpisodeSpec]
+    ) -> dict[str, Any]:
+        if self.config.algorithm.name != "ppo":
+            return {"available": False, "reason": "matched categorical actions apply to PPO"}
+        path = self.run_dir / "validation_baseline_episodes.json"
+        fingerprint = self._validation_specs_fingerprint()
+        reports = None
+        if path.is_file():
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            if cached.get("episode_specs_sha256") == fingerprint:
+                reports = cached.get("reports")
+        if reports is None:
+            reports = evaluator.evaluate_matched_baselines(specs)
+            path.write_text(
+                json.dumps(
+                    {"episode_specs_sha256": fingerprint, "reports": reports}, indent=2
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        report = evaluator.matched_baseline_report(
+            policy_evaluation, specs, baseline_reports=reports
+        )
+        return report
+
     def _maybe_evaluate(self) -> None:
         interval = self.config.logging.evaluate_every_env_steps
         if self._env_steps % interval < self.config.training.collect_batch:
@@ -565,28 +716,83 @@ class BaseTrainer(ABC):
             self.env_config,
             self.encoder,
             self.window_config,
-            selection_metric=self.config.selection.metric,
+            selection_metric=self.selection_metric_name,
             lambda_drawdown=self.config.selection.lambda_drawdown,
             eval_horizon=self.config.evaluation.eval_horizon,
             eval_seed=self.config.evaluation.eval_seed,
             context_length=self.config.environment.context_length,
         )
+        specs = self._fixed_validation_specs()
         eval_result = evaluator.evaluate(
             self.policy(),
             self.config.algorithm.name,
             "validation",
             self.config.evaluation.validation_episodes,
+            episode_specs=specs,
         )
         score = eval_result.score
+        metrics = eval_result.metrics
+        rows = cast(list[dict[str, Any]], metrics["episodes"])
+        non_jpy = [row["total_return"] for row in rows if row["instrument"] != "USDJPY"]
+        positive_profit = sum(max(row["total_return"], 0.0) for row in rows)
+        jpy_positive_profit = sum(
+            max(row["total_return"], 0.0)
+            for row in rows
+            if row["instrument"] == "USDJPY"
+        )
+        baseline_report = self._matched_validation_baselines(evaluator, eval_result, specs)
         entry = {
             "env_steps": self._env_steps,
             "gradient_updates": self._gradient_updates,
-            "validation_score": score,
-            **{k: v for k, v in eval_result.metrics.items() if not k.startswith("_")},
+            "validation_selection_score": score,
+            "selection_metric_name": self.selection_metric_name,
+            "mean_episode_log_return": metrics["mean_episode_log_return"],
+            "mean_episode_return": metrics["mean_episode_return"],
+            "median_episode_return": metrics["median_episode_return"],
+            "episode_return_std": metrics["episode_return_std"],
+            "p10_episode_return": metrics["p10_episode_return"],
+            "p25_episode_return": metrics["p25_episode_return"],
+            "p75_episode_return": metrics["p75_episode_return"],
+            "p90_episode_return": metrics["p90_episode_return"],
+            "profitable_episode_fraction": metrics["profitable_episode_fraction"],
+            "worst_episode_return": metrics["worst_episode_return"],
+            "best_episode_return": metrics["best_episode_return"],
+            "mean_turnover_per_episode": metrics["mean_turnover_per_episode"],
+            "mean_executions_per_episode": metrics["mean_executions_per_episode"],
+            "mean_episode_return_excluding_usdjpy": (
+                float(np.mean(non_jpy)) if non_jpy else None
+            ),
+            "usdjpy_contribution_to_total_episode_profit": (
+                jpy_positive_profit / positive_profit if positive_profit else None
+            ),
+            "overlap_diagnostics": metrics["overlap_diagnostics"],
+            "per_instrument": metrics["per_instrument"],
+            "actions": metrics["actions"],
+            "matched_baselines": baseline_report,
+            "cross_episode_mean_return_series": metrics[
+                "cross_episode_mean_return_series"
+            ],
         }
         self.validation_history.append(entry)
+        self.latest_validation_summary = entry
         val_fields = {
-            f"val_{k}": v for k, v in entry.items() if k not in ("env_steps", "gradient_updates")
+            f"val_{k}": v
+            for k, v in entry.items()
+            if k
+            in {
+                "validation_selection_score",
+                "mean_episode_log_return",
+                "mean_episode_return",
+                "median_episode_return",
+                "episode_return_std",
+                "p10_episode_return",
+                "p90_episode_return",
+                "profitable_episode_fraction",
+                "mean_turnover_per_episode",
+                "mean_executions_per_episode",
+                "mean_episode_return_excluding_usdjpy",
+                "usdjpy_contribution_to_total_episode_profit",
+            }
         }
         self.metric_store.record(
             env_steps=self._env_steps,
@@ -597,6 +803,7 @@ class BaseTrainer(ABC):
         if score > self.best_score:
             self.best_score = score
             self.best_checkpoint = "best"
+            self.best_checkpoint_step = self._env_steps
             self._save_checkpoint("best")
             self.logger.progress_block(
                 f"{self.config.algorithm.name.upper()} EVALUATION",
@@ -605,13 +812,25 @@ class BaseTrainer(ABC):
                     "Gradient updates": f"{self._gradient_updates:,}",
                     "Training episodes": f"{self._episodes:,}",
                     "Validation episodes": self.config.evaluation.validation_episodes,
-                    "Mean return": round(_to_float(entry.get("total_return")), 6),
-                    "Sharpe": round(_to_float(entry.get("sharpe")), 4),
-                    "Sortino": round(_to_float(entry.get("sortino")), 4),
-                    "Max drawdown": round(_to_float(entry.get("max_drawdown_pct")), 4),
-                    "Turnover": round(_to_float(entry.get("turnover")), 4),
+                    "Selection metric": self.selection_metric_name,
+                    "Mean episode log return": round(
+                        _to_float(entry.get("mean_episode_log_return")), 8
+                    ),
+                    "Mean episode return": round(
+                        _to_float(entry.get("mean_episode_return")), 8
+                    ),
+                    "Median episode return": round(
+                        _to_float(entry.get("median_episode_return")), 8
+                    ),
+                    "Profitable episodes": round(
+                        _to_float(entry.get("profitable_episode_fraction")), 4
+                    ),
+                    "Mean turnover / episode": round(
+                        _to_float(entry.get("mean_turnover_per_episode")), 4
+                    ),
                     "Score": round(score, 4),
-                    "Best validation score": round(self.best_score, 4),
+                    "Best selection score": round(self.best_score, 8),
+                    "Best checkpoint step": self.best_checkpoint_step,
                     "Current checkpoint": self.best_checkpoint,
                 },
             )
@@ -625,6 +844,9 @@ class BaseTrainer(ABC):
     def _save_checkpoint(self, tag: str) -> None:
         from forexmind.training.checkpoint import build_checkpoint_state
 
+        specs = self._fixed_validation_specs()
+        current_score = self.latest_validation_summary.get("validation_selection_score")
+        best_score = self.best_score if np.isfinite(self.best_score) else None
         state = build_checkpoint_state(
             algorithm=self.config.algorithm.name,
             policy_state={
@@ -639,7 +861,18 @@ class BaseTrainer(ABC):
             episodes=self._episodes,
             config=self.config,
             dataset_version=self.config.dataset_version,
-            best_validation_score=self.best_score,
+            # Never populate the ambiguous legacy field in a new-schema checkpoint.
+            best_validation_score=None,
+            selection_schema=SELECTION_SCHEMA,
+            selection_metric_name=self.selection_metric_name,
+            validation_selection_score=current_score,
+            best_selection_score=best_score,
+            best_checkpoint_step=self.best_checkpoint_step,
+            validation_seed=self.config.evaluation.eval_seed,
+            validation_episode_count=self.config.evaluation.validation_episodes,
+            validation_episode_specs=[spec.to_dict() for spec in specs],
+            validation_summary=self.latest_validation_summary,
+            legacy_selection_score=self.legacy_selection_score,
             best_checkpoint=self.best_checkpoint,
             validation_history=self.validation_history,
             trainer_state={
@@ -657,6 +890,15 @@ class BaseTrainer(ABC):
                 "trainer_local": self._local_rng_state(),
             },
         )
+        state.update(
+            mean_episode_return=self.latest_validation_summary.get("mean_episode_return"),
+            median_episode_return=self.latest_validation_summary.get("median_episode_return"),
+            profitable_episode_fraction=self.latest_validation_summary.get(
+                "profitable_episode_fraction"
+            ),
+            validation_seed=self.config.evaluation.eval_seed,
+            validation_episode_count=len(specs),
+        )
         self.checkpoints.save(tag, state)
 
     def _restore_from_checkpoint(self, path: str | Path) -> None:
@@ -665,14 +907,49 @@ class BaseTrainer(ABC):
         self._env_steps = int(state.get("env_steps", 0))
         self._gradient_updates = int(state.get("gradient_updates", 0))
         self._episodes = int(state.get("episodes", 0))
-        best_score = state.get("best_validation_score")
-        if best_score is None:
-            print("[resume] best_validation_score unavailable in checkpoint; using -inf fallback")
-        else:
-            self.best_score = float(best_score)
-        if "best_checkpoint" in state:
+        if state.get("selection_schema") == SELECTION_SCHEMA:
+            metric = state.get("selection_metric_name")
+            from forexmind.training.evaluator import VALID_SELECTION_METRICS
+
+            if metric not in VALID_SELECTION_METRICS:
+                raise ValueError(
+                    f"checkpoint has invalid selection metric {metric!r} for {SELECTION_SCHEMA}"
+                )
+            self.selection_metric_name = str(metric)
+            best_score = state.get("best_selection_score")
+            self.best_score = float(best_score) if best_score is not None else -float("inf")
             self.best_checkpoint = state.get("best_checkpoint")
-        self.validation_history = list(state.get("validation_history", []) or [])
+            best_step = state.get("best_checkpoint_step")
+            self.best_checkpoint_step = int(best_step) if best_step is not None else None
+            self.latest_validation_summary = dict(state.get("validation_summary", {}) or {})
+            self.validation_history = list(state.get("validation_history", []) or [])
+            saved_specs = list(state.get("validation_episode_specs", []) or [])
+            if saved_specs:
+                self.validation_episode_specs = [
+                    self._spec_from_dict(dict(value)) for value in saved_specs
+                ]
+                self._validate_fixed_specs(self.validation_episode_specs)
+                self._write_validation_specs()
+        else:
+            old_score = state.get("legacy_selection_score")
+            if old_score is None:
+                old_score = state.get("best_validation_score")
+            self.legacy_selection_score = (
+                float(old_score) if isinstance(old_score, (int, float)) else None
+            )
+            self.legacy_validation_history = list(state.get("validation_history", []) or [])
+            self.best_score = -float("inf")
+            self.best_checkpoint = None
+            self.best_checkpoint_step = None
+            self.latest_validation_summary = {}
+            self.validation_history = []
+            print(
+                "[resume] checkpoint used the legacy synthetic evaluator; "
+                f"legacy_selection_score={self.legacy_selection_score!r}. "
+                "New episode-level selection starts unavailable and will be "
+                "established at the next validation.",
+                flush=True,
+            )
         trainer_state = state.get("trainer_state", {}) or {}
         rewards = trainer_state.get("episode_reward_by_worker", {}) or {}
         steps = trainer_state.get("episode_steps_by_worker", {}) or {}
@@ -709,6 +986,8 @@ class BaseTrainer(ABC):
     def _finalize_no_training(self) -> dict[str, Any]:
         workers_alive = getattr(self.collector, "alive_workers", 0)
         self.collector.close()
+        if self.best_checkpoint is None:
+            self._evaluate_validation()
         summary = {
             "status": "already_complete",
             "algorithm": self.config.algorithm.name,
@@ -716,7 +995,12 @@ class BaseTrainer(ABC):
             "gradient_updates": self._gradient_updates,
             "episodes": self._episodes,
             "best_checkpoint": self.best_checkpoint,
-            "best_validation_score": self.best_score,
+            "selection_metric_name": self.selection_metric_name,
+            "best_selection_score": (
+                self.best_score if np.isfinite(self.best_score) else None
+            ),
+            "best_checkpoint_step": self.best_checkpoint_step,
+            "legacy_selection_score": self.legacy_selection_score,
             "wall_seconds": 0.0,
             "steps_per_second": 0.0,
             "workers_configured": self._resolved_num_workers,
@@ -830,9 +1114,8 @@ class BaseTrainer(ABC):
         workers_alive = getattr(self.collector, "alive_workers", 0)
         self.collector.close()
         if self.best_checkpoint is None:
-            # Never evaluated: save current as best so a checkpoint always exists.
-            self.best_checkpoint = "best"
-            self._save_checkpoint("best")
+            # A best checkpoint must always be earned by the valid selector.
+            self._evaluate_validation()
         # Always leave a final checkpoint so the completed run is resumable /
         # inspectable even if the periodic intervals never aligned with the end.
         self._save_checkpoint("final")
@@ -846,7 +1129,12 @@ class BaseTrainer(ABC):
             "gradient_updates": self._gradient_updates,
             "episodes": self._episodes,
             "best_checkpoint": self.best_checkpoint,
-            "best_validation_score": self.best_score,
+            "selection_metric_name": self.selection_metric_name,
+            "best_selection_score": (
+                self.best_score if np.isfinite(self.best_score) else None
+            ),
+            "best_checkpoint_step": self.best_checkpoint_step,
+            "legacy_selection_score": self.legacy_selection_score,
             "wall_seconds": round(wall, 2),
             "steps_per_second": round(self._env_steps / wall, 1) if wall > 0 else 0.0,
             "workers_configured": self._resolved_num_workers,

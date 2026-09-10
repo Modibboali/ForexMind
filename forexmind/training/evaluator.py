@@ -4,8 +4,8 @@ Uses the existing Phase-2 :class:`EvaluationRunner` — no separate evaluation
 engine.  The frozen policy is wrapped in a :class:`PolicyAgent` with
 *deterministic* action selection (policy mean; no exploration noise).
 
-Also implements validation-based checkpoint selection
-(``Score = Sharpe - lambda * max_drawdown_pct`` by default).
+Checkpoint selection uses independent episode outcomes. Synthetic, step-aligned
+diagnostic curves are never eligible for model selection.
 """
 
 from __future__ import annotations
@@ -13,14 +13,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
 from torch import nn
 
 from forexmind.config import EnvironmentConfig
 from forexmind.data.splits import SplitDataset
 from forexmind.episodes.config import EpisodeConfig
 from forexmind.episodes.sampler import EpisodeSampler, EpisodeSpec
-from forexmind.evaluation.runner import AgentEvaluation, EvaluationRunner
+from forexmind.evaluation.runner import EvaluationRunner
+from forexmind.evaluation.sampled import (
+    EnterAndHoldAgent,
+    paired_comparison,
+    sampled_report,
+)
 from forexmind.observation.encoder import ObservationEncoder
 from forexmind.observation.window import WindowConfig
 from forexmind.training.policies import PolicyAgent
@@ -44,17 +48,27 @@ def _f(value: object, default: float = 0.0) -> float:
     return default
 
 
-def selection_score(metrics: dict[str, object], metric: str, lambda_dd: float = 1.0) -> float:
-    """Configurable validation selection score."""
-    if metric == "sharpe":
-        return _f(metrics.get("sharpe"))
-    if metric == "total_return":
-        return _f(metrics.get("total_return"))
-    if metric == "sharpe_drawdown":
-        sharpe = _f(metrics.get("sharpe"))
-        mdd = _f(metrics.get("max_drawdown_pct"))
-        return sharpe - lambda_dd * mdd
-    raise ValueError(f"unsupported selection metric {metric!r}")
+DEFAULT_SELECTION_METRIC = "mean_episode_log_return"
+VALID_SELECTION_METRICS = {DEFAULT_SELECTION_METRIC, "mean_episode_return"}
+LEGACY_SELECTION_METRICS = {"sharpe", "sharpe_drawdown", "total_return"}
+
+
+def selection_score(
+    metrics: dict[str, object], metric: str = DEFAULT_SELECTION_METRIC, lambda_dd: float = 1.0
+) -> float:
+    """Return an episode-level selection score; reject legacy synthetic inputs."""
+    del lambda_dd  # retained only for source compatibility with older callers
+    if metric not in VALID_SELECTION_METRICS:
+        if metric in LEGACY_SELECTION_METRICS:
+            raise ValueError(
+                f"legacy selection metric {metric!r} is invalid for independently reset "
+                f"episodes; use {DEFAULT_SELECTION_METRIC!r}"
+            )
+        raise ValueError(f"unsupported selection metric {metric!r}")
+    value = metrics.get(metric)
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"selection metric {metric!r} is unavailable")
+    return float(value)
 
 
 @dataclass
@@ -81,7 +95,7 @@ class PolicyEvaluator:
         env_config: EnvironmentConfig,
         encoder: ObservationEncoder,
         window_config: WindowConfig | None = None,
-        selection_metric: str = "sharpe_drawdown",
+        selection_metric: str = DEFAULT_SELECTION_METRIC,
         lambda_drawdown: float = 1.0,
         eval_horizon: int = 512,
         eval_seed: int = 42,
@@ -95,7 +109,17 @@ class PolicyEvaluator:
         self.lambda_drawdown = lambda_drawdown
         self.eval_horizon = eval_horizon
         self.eval_seed = eval_seed
-        self._runner = EvaluationRunner(dataset, env_config, self.encoder, self.window_config)
+        if selection_metric not in VALID_SELECTION_METRICS:
+            raise ValueError(
+                f"selection_metric must be episode-level; got {selection_metric!r}"
+            )
+        self._runner = EvaluationRunner(
+            dataset,
+            env_config,
+            self.encoder,
+            self.window_config,
+            capture_account_state=True,
+        )
 
     def _episode_specs(self, split: str, n_episodes: int, seed: int) -> list[EpisodeSpec]:
         cfg = EpisodeConfig(
@@ -106,6 +130,20 @@ class PolicyEvaluator:
         )
         return EpisodeSampler(self.dataset, cfg).sample(n_episodes, seed=seed)
 
+    def selection_episode_specs(
+        self, split: str, n_episodes: int, seed: int
+    ) -> list[EpisodeSpec]:
+        """Fixed, balanced, non-overlapping specifications for model selection."""
+        cfg = EpisodeConfig(
+            split=split,
+            horizon=self.eval_horizon,
+            context_length=self.window_config.context_length,
+            seed=seed,
+        )
+        return EpisodeSampler(self.dataset, cfg).sample_non_overlapping(
+            n_episodes, seed=seed, split=split
+        )
+
     def evaluate(
         self,
         policy: nn.Module,
@@ -114,84 +152,86 @@ class PolicyEvaluator:
         n_episodes: int,
         *,
         seed: int | None = None,
+        episode_specs: list[EpisodeSpec] | None = None,
     ) -> PolicyEvaluation:
-        """Run deterministic episodes on ``split`` and compute metrics."""
+        """Run deterministic episodes and score their independent outcomes."""
         agent = PolicyAgent(policy, algorithm, name=f"{algorithm}_eval")
         seed = seed if seed is not None else self.eval_seed
-        specs = self._episode_specs(split, n_episodes, seed)
+        specs = episode_specs or self._episode_specs(split, n_episodes, seed)
+        if len(specs) != n_episodes or any(spec.split != split for spec in specs):
+            raise ValueError("episode_specs must match split and requested episode count")
         ev = self._runner.run_agent(agent, specs)
-
-        # Aggregate metrics from pooled log returns (equal weight per step).
-        from forexmind.evaluation.aggregation import aggregate_across_instruments
-        from forexmind.evaluation.metrics import compute_series_metrics
-
         grouped = ev.trajectories_by_instrument
-        _ts, agg_log, per_instrument_series = aggregate_across_instruments(grouped)
-        periods_per_year = self._runner.periods_per_year(split)
-        metrics = compute_series_metrics(agg_log, periods_per_year)
-        metrics["_selection_score"] = selection_score(
-            metrics, self.selection_metric, self.lambda_drawdown
-        )
-        # Trading-style diagnostics from pooled trajectories.
-        metrics["turnover"] = _pooled_turnover(ev)
-        metrics["mean_reward"] = _pooled_mean_reward(ev)
-        if algorithm == "ppo":
-            metrics.update(_action_diagnostics([t for ts in grouped.values() for t in ts]))
-
-        per_instrument: dict[str, dict[str, object]] = {}
-        for instr, series in per_instrument_series.items():
-            per_instrument[instr] = compute_series_metrics(series, periods_per_year)
-            if algorithm == "ppo":
-                per_instrument[instr].update(_action_diagnostics(grouped[instr]))
+        trajectories = [t for values in grouped.values() for t in values]
+        metrics = sampled_report(trajectories, self._runner.periods_per_year(split))
+        metrics["selection_metric_name"] = self.selection_metric
+        metrics["_selection_score"] = selection_score(metrics, self.selection_metric)
 
         return PolicyEvaluation(
             split=split,
             metrics=metrics,
-            per_instrument=per_instrument,
+            per_instrument=metrics["per_instrument"],
             trajectories=dict(grouped),
         )
 
     def score_of(self, evaluation: PolicyEvaluation) -> float:
         return evaluation.score
 
+    def evaluate_sampled(
+        self,
+        policy: nn.Module,
+        algorithm: str,
+        split: str,
+        n_episodes: int,
+        *,
+        seed: int | None = None,
+        episode_specs: list[EpisodeSpec] | None = None,
+    ) -> dict[str, Any]:
+        """Return the corrected sampled report used by standalone tools."""
+        return self.evaluate(
+            policy,
+            algorithm,
+            split,
+            n_episodes,
+            seed=seed,
+            episode_specs=episode_specs,
+        ).metrics
 
-def _pooled_turnover(ev: AgentEvaluation) -> float:
-    total_notional = 0.0
-    capital = 0.0
-    for trajs in ev.trajectories_by_instrument.values():
-        for t in trajs:
-            capital += _f(t.info.get("initial_balance"))
-            for trade in t.trade_log:
-                # Prefer account-currency notional (Phase 3.1); fall back to
-                # quote-currency notional for older logs (USD-quote pairs only).
-                if "notional_account" in trade:
-                    total_notional += abs(_f(trade.get("notional_account")))
-                else:
-                    units = trade.get("units_delta", 0.0)
-                    price = trade.get("execution_price") or 0.0
-                    total_notional += abs(_f(units)) * _f(price)
-    return total_notional / capital if capital > 0 else 0.0
-
-
-def _pooled_mean_reward(ev: AgentEvaluation) -> float:
-    rewards = [
-        float(r)
-        for trajs in ev.trajectories_by_instrument.values()
-        for t in trajs
-        for r in t.rewards
-    ]
-    return float(np.mean(rewards)) if rewards else 0.0
-
-
-def _action_diagnostics(trajectories: list) -> dict[str, float]:
-    from forexmind.training.action_diagnostics import ActionDiagnostics
-
-    diagnostics = ActionDiagnostics()
-    for episode, trajectory in enumerate(trajectories):
-        indices = trajectory.info["action_indices"]
-        infos = trajectory.info["action_diagnostics"]
-        for step, (action, info) in enumerate(zip(indices, infos, strict=True)):
-            diagnostics.record(
-                action, info, episode=episode, step=step, done=step == len(indices) - 1
+    def evaluate_matched_baselines(
+        self, episode_specs: list[EpisodeSpec]
+    ) -> dict[str, dict[str, Any]]:
+        """Evaluate static exposures once for a fixed validation specification set."""
+        reports: dict[str, dict[str, Any]] = {}
+        for action in (0, 6, 7, 8, 9, 5, 4, 3, 2):
+            agent = EnterAndHoldAgent(action)
+            evaluation = self._runner.run_agent(agent, episode_specs)
+            trajectories = [
+                trajectory
+                for values in evaluation.trajectories_by_instrument.values()
+                for trajectory in values
+            ]
+            reports[agent.name] = sampled_report(
+                trajectories, self._runner.periods_per_year(episode_specs[0].split)
             )
-    return diagnostics.summary()
+        return reports
+
+    def matched_baseline_report(
+        self,
+        policy_evaluation: PolicyEvaluation,
+        episode_specs: list[EpisodeSpec],
+        *,
+        baseline_reports: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Compare current PPO outcomes with fixed enter-once/HOLD baselines."""
+        comparisons: dict[str, Any] = {}
+        baselines: dict[str, Any] = {}
+        reports = baseline_reports or self.evaluate_matched_baselines(episode_specs)
+        for name, report in reports.items():
+            baselines[name] = {
+                "mean_episode_return": report["mean_episode_return"],
+                "median_episode_return": report["median_episode_return"],
+                "profitable_episode_fraction": report["profitable_episode_fraction"],
+            }
+            comparisons[name] = paired_comparison(policy_evaluation.metrics, report)
+            comparisons[name].pop("pairs")
+        return {"diagnostic_only": True, "baselines": baselines, "paired": comparisons}
