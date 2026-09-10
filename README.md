@@ -299,6 +299,38 @@ selection remain unchanged.
 python -m tools.audit_ppo_evaluation --checkpoint forexmind/best.pt --split validation --episodes 100 --seed 42
 ```
 
+### MuZero core networks (Stage 4.1)
+
+`forexmind/muzero/` implements only the MuZero neural architecture and its
+inference contracts — representation `h_theta`, dynamics `g_theta`, and
+prediction `f_theta`. There is no MCTS, replay, self-play, MuZero loss, or
+training loop yet, and `recurrent_inference` is a pure neural latent transition
+that never calls `env.step()`.
+
+```python
+from forexmind.muzero import MuZeroConfig, build_muzero_network
+
+config = MuZeroConfig.from_encoder_config()   # obs_dim derived from the encoder (351)
+model = build_muzero_network(config)          # 540,372 parameters at the defaults
+
+root = model.initial_inference(observation, action_mask)
+child = model.recurrent_inference(root.latent_state, action, next_mask)
+```
+
+Both methods share one `NetworkOutput` (`latent_state`, `policy_logits`,
+`value`, `reward`, plus optional `value_logits` / `reward_logits`). The action
+space is the existing 10-way categorical Forex system, actions are embedded
+before entering the dynamics network, and action masks are applied in the
+inference layer so invalid actions get an effective zero prior while HOLD stays
+valid. Reward/value use configurable categorical-support heads
+(`use_support=False` switches to scalar heads without changing the API). See
+[Stage 4.1 report](docs/stage41_muzero_networks.md) for shapes, tests, and the
+inference throughput baseline.
+
+```powershell
+python -m tools.benchmark_muzero_inference --batch-sizes 1 16 64 256
+```
+
 ---
 ## 8. Reward
 
