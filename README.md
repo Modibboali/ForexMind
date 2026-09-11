@@ -345,10 +345,44 @@ python -m tools.benchmark_muzero_inference --batch-sizes 1 16 64 256
 python -m tools.benchmark_muzero_search --simulations 16 32 64 128
 ```
 
+### MuZero trajectory collection and replay (Stage 4.3)
+
+`MuZeroCollector` drives the real environment with MCTS and records correctly
+indexed trajectories (`observations` = T+1, `actions`/`rewards`/`root_policies`/
+`root_values`/`action_masks` = T). Real environment rewards are stored for the
+transition that produced them; imagined MCTS transitions never enter a
+trajectory. Observations are stored, not latent states, because latents go stale
+as weights change.
+
+`TrajectoryReplayBuffer` stores whole trajectories with FIFO-bounded capacity,
+position-level uniform sampling, optional decision-rich mixtures (off by
+default), non-train leakage protection, sampling diagnostics, and memory
+accounting. `replay.sample(...)` returns a `MuZeroBatch` whose unroll alignment
+is: `initial_inference(o_t)` → `pi_t`, `z_t`; `recurrent(a_t)` → `r_{t+1}`,
+`pi_{t+1}`, `z_{t+1}`; and so on, with explicit `policy_masks` / `value_masks` /
+`reward_masks` for padded and boundary positions.
+
+```python
+from forexmind.muzero import CollectorConfig, MuZeroCollector, ReplayConfig
+from forexmind.muzero import TargetConfig, TrajectoryReplayBuffer
+
+collector = MuZeroCollector(dataset, env_config, encoder_config, model, CollectorConfig())
+replay = TrajectoryReplayBuffer(ReplayConfig(max_trajectories=256))
+collector.collect_into(replay, 4)                 # train split only
+
+batch = replay.sample(8, target_config=TargetConfig(num_unroll_steps=5, td_steps=5))
+```
+
+```powershell
+python -m tools.collect_muzero_trajectories --trajectories 4 --horizon 16 --simulations 8
+```
+
 See [Stage 4.1 report](docs/stage41_muzero_networks.md) for the network shapes
-and inference throughput, and
-[Stage 4.2 report](docs/stage42_muzero_search.md) for the search architecture,
-PUCT equation, backup semantics, masking, tests, and search-cost curve.
+and inference throughput, [Stage 4.2 report](docs/stage42_muzero_search.md) for
+the search architecture, PUCT equation, backup semantics, masking, and
+search-cost curve, and
+[Stage 4.3 report](docs/stage43_muzero_replay.md) for the trajectory contract,
+target equations, replay architecture, and real-data collection results.
 
 ---
 ## 8. Reward

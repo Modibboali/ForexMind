@@ -1,16 +1,18 @@
-"""MuZero for ForexMind (Stages 4.1-4.2).
+"""MuZero for ForexMind (Stages 4.1-4.3).
 
 Stage 4.1 added the neural core and inference contracts (``h_theta``,
-``g_theta``, ``f_theta``).  Stage 4.2 adds the MCTS/PUCT search layer that plans
-in the learned latent space over the frozen six-action space.
+``g_theta``, ``f_theta``).  Stage 4.2 added the MCTS/PUCT search layer over the
+frozen six-action space.  Stage 4.3 adds real trajectory collection,
+trajectory-level replay, and MuZero policy/value/reward target construction.
 
-Still **not** implemented: MuZero loss, replay buffer, self-play, reanalysis,
-distributed actors, or Stochastic MuZero.
+Still **not** implemented: the MuZero loss, optimizer, target network,
+reanalysis, prioritized replay, distributed actors, or Stochastic MuZero.
 
 Quick start::
 
     from forexmind.muzero import MuZeroConfig, build_muzero_network, MuZeroMCTS
-    from forexmind.muzero import SearchConfig
+    from forexmind.muzero import SearchConfig, CollectorConfig, MuZeroCollector
+    from forexmind.muzero import ReplayConfig, TrajectoryReplayBuffer, TargetConfig
 
     config = MuZeroConfig.from_encoder_config()  # obs_dim derived from the encoder
     model = build_muzero_network(config)
@@ -18,6 +20,11 @@ Quick start::
 
     result = search.search_from_env(env, observation)
     result.action, result.policy, result.visit_counts
+
+    collector = MuZeroCollector(dataset, env_config, encoder_config, model, CollectorConfig())
+    replay = TrajectoryReplayBuffer(ReplayConfig(max_trajectories=64))
+    collector.collect_into(replay, 4)
+    batch = replay.sample(8, target_config=TargetConfig(num_unroll_steps=5))
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ from forexmind.muzero.actions import (
     mu_zero_action_index,
     project_action_mask,
 )
+from forexmind.muzero.collector import CollectionStats, CollectorConfig, MuZeroCollector
 from forexmind.muzero.config import MuZeroConfig, SearchConfig, observation_dim
 from forexmind.muzero.inference import (
     MuZeroNetwork,
@@ -48,6 +56,11 @@ from forexmind.muzero.networks import (
     parameter_report,
 )
 from forexmind.muzero.node import Node
+from forexmind.muzero.replay import (
+    SAMPLING_STRATEGIES,
+    ReplayConfig,
+    TrajectoryReplayBuffer,
+)
 from forexmind.muzero.search import (
     MuZeroMCTS,
     SearchDiagnostics,
@@ -56,6 +69,19 @@ from forexmind.muzero.search import (
     visit_count_policy,
 )
 from forexmind.muzero.support import scalar_to_support, support_to_scalar
+from forexmind.muzero.targets import (
+    MuZeroBatch,
+    MuZeroSample,
+    TargetConfig,
+    build_unroll_sample,
+    collate_samples,
+    value_target,
+)
+from forexmind.muzero.trajectory import (
+    MuZeroTrajectory,
+    TrajectoryMetadata,
+    model_version,
+)
 from forexmind.muzero.types import NetworkOutput
 
 __all__ = [
@@ -63,30 +89,45 @@ __all__ = [
     "MUZERO_ENV_ACTION_INDICES",
     "MUZERO_NUM_ACTIONS",
     "MUZERO_TARGET_EXPOSURES",
+    "SAMPLING_STRATEGIES",
+    "CollectionStats",
+    "CollectorConfig",
     "DynamicsNetwork",
     "MinMaxStats",
+    "MuZeroBatch",
+    "MuZeroCollector",
     "MuZeroConfig",
     "MuZeroMCTS",
     "MuZeroNetwork",
+    "MuZeroSample",
+    "MuZeroTrajectory",
     "NetworkOutput",
     "Node",
     "PlanningState",
     "PredictionNetwork",
+    "ReplayConfig",
     "RepresentationNetwork",
     "SearchConfig",
     "SearchDiagnostics",
     "SearchResult",
+    "TargetConfig",
+    "TrajectoryMetadata",
+    "TrajectoryReplayBuffer",
     "apply_action_mask",
     "build_muzero_network",
+    "build_unroll_sample",
+    "collate_samples",
     "count_parameters",
     "discounted_backup",
     "env_action_index",
     "masked_policy_probs",
+    "model_version",
     "mu_zero_action_index",
     "observation_dim",
     "parameter_report",
     "project_action_mask",
     "scalar_to_support",
     "support_to_scalar",
+    "value_target",
     "visit_count_policy",
 ]
