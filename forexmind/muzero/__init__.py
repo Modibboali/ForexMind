@@ -45,8 +45,23 @@ from forexmind.muzero.calibration import (
     describe_targets,
     propose_scale,
 )
-from forexmind.muzero.collector import CollectionStats, CollectorConfig, MuZeroCollector
+from forexmind.muzero.collector import (
+    CollectedTrajectory,
+    CollectionStats,
+    CollectorConfig,
+    MuZeroCollector,
+)
 from forexmind.muzero.config import MuZeroConfig, SearchConfig, observation_dim
+from forexmind.muzero.diagnostics import (
+    RootSearchRecord,
+    search_summary,
+    staleness_summary,
+)
+from forexmind.muzero.evaluation import (
+    MuZeroAgent,
+    MuZeroEvaluation,
+    MuZeroEvaluator,
+)
 from forexmind.muzero.inference import (
     MuZeroNetwork,
     apply_action_mask,
@@ -80,6 +95,11 @@ from forexmind.muzero.replay import (
     ReplayConfig,
     TrajectoryReplayBuffer,
 )
+from forexmind.muzero.replay_store import (
+    load_replay,
+    replay_store_report,
+    save_replay,
+)
 from forexmind.muzero.search import (
     MuZeroMCTS,
     SearchDiagnostics,
@@ -103,6 +123,7 @@ from forexmind.muzero.targets import (
     collate_samples,
     value_target,
 )
+from forexmind.muzero.trainer import MuZeroTrainer, MuZeroTrainingConfig
 from forexmind.muzero.trajectory import (
     MuZeroTrajectory,
     TrajectoryMetadata,
@@ -117,21 +138,27 @@ __all__ = [
     "MUZERO_TARGET_EXPOSURES",
     "SAMPLING_STRATEGIES",
     "SUPPORT_RANGE",
+    "CollectedTrajectory",
     "CollectionStats",
     "CollectorConfig",
     "DynamicsNetwork",
     "LearnerConfig",
     "LossConfig",
     "MinMaxStats",
+    "MuZeroAgent",
     "MuZeroBatch",
     "MuZeroCollector",
     "MuZeroConfig",
+    "MuZeroEvaluation",
+    "MuZeroEvaluator",
     "MuZeroLearner",
     "MuZeroLossResult",
     "MuZeroMCTS",
     "MuZeroNetwork",
     "MuZeroPrediction",
     "MuZeroSample",
+    "MuZeroTrainer",
+    "MuZeroTrainingConfig",
     "MuZeroTrajectory",
     "NetworkOutput",
     "Node",
@@ -140,6 +167,7 @@ __all__ = [
     "PredictionNetwork",
     "ReplayConfig",
     "RepresentationNetwork",
+    "RootSearchRecord",
     "SearchConfig",
     "SearchDiagnostics",
     "SearchResult",
@@ -159,6 +187,7 @@ __all__ = [
     "discounted_backup",
     "env_action_index",
     "inverse_transform_to_scalar",
+    "load_replay",
     "masked_policy_probs",
     "model_version",
     "mu_zero_action_index",
@@ -167,8 +196,12 @@ __all__ = [
     "parameter_report",
     "project_action_mask",
     "propose_scale",
+    "replay_store_report",
     "saturation_fraction",
+    "save_replay",
     "scalar_to_support",
+    "search_summary",
+    "staleness_summary",
     "support_to_scalar",
     "transform_to_scalar",
     "value_target",

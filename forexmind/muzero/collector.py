@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import torch
 
 from forexmind.data.splits import SPLIT_NAMES, SplitDataset
 from forexmind.environment.forex_env import ForexEnvironment
@@ -38,12 +39,19 @@ from forexmind.muzero.actions import (
     project_action_mask,
 )
 from forexmind.muzero.config import SearchConfig
+from forexmind.muzero.diagnostics import RootSearchRecord
+from forexmind.muzero.inference import apply_action_mask
 from forexmind.muzero.search import MuZeroMCTS
 from forexmind.muzero.trajectory import MuZeroTrajectory, TrajectoryMetadata, model_version
 from forexmind.observation.encoder import EncoderConfig, ObservationEncoder
 from forexmind.observation.window import MarketWindowBuilder, WindowConfig
 
-__all__ = ["CollectionStats", "CollectorConfig", "MuZeroCollector"]
+__all__ = [
+    "CollectedTrajectory",
+    "CollectionStats",
+    "CollectorConfig",
+    "MuZeroCollector",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +73,12 @@ class CollectorConfig:
     root_exploration_fraction: float = 0.25
     seed: int = 0
     boundary_search: bool = True  # run one extra search for truncated final states
+    #: Integrated-loop model version (Stage 4.5) recorded on every trajectory.
+    network_version: int = 0
+    #: Capture per-root search diagnostics (Stage 4.5) in addition to the
+    #: compact replay arrays.  Off by default: the trace is for the training
+    #: loop, never for replay storage.
+    capture_diagnostics: bool = False
 
     def __post_init__(self) -> None:
         if self.split not in SPLIT_NAMES:
@@ -96,7 +110,17 @@ class CollectorConfig:
             "root_exploration_fraction": self.root_exploration_fraction,
             "seed": self.seed,
             "boundary_search": self.boundary_search,
+            "network_version": self.network_version,
+            "capture_diagnostics": self.capture_diagnostics,
         }
+
+
+@dataclass(slots=True)
+class CollectedTrajectory:
+    """One collected trajectory plus the optional per-root search trace."""
+
+    trajectory: MuZeroTrajectory
+    records: list[RootSearchRecord] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -239,6 +263,15 @@ class MuZeroCollector:
 
     def collect_trajectory(self, index: int) -> MuZeroTrajectory:
         """Collect exactly one trajectory for episode ``index``."""
+        return self.collect_with_diagnostics(index).trajectory
+
+    def collect_with_diagnostics(self, index: int) -> CollectedTrajectory:
+        """Collect one trajectory plus its per-root search trace.
+
+        The trace (Stage 4.5 S16-S22) is *not* stored in replay: it is returned
+        to the caller, aggregated into training diagnostics and discarded, so
+        replay stays as compact as Stage 4.3 made it.
+        """
         spec = self.sample_spec(index)
         env = self._make_env(spec.instrument)
         builder = self._make_builder(spec.instrument)
@@ -264,6 +297,7 @@ class MuZeroCollector:
         # Planning states are read from the live account (ground truth), so the
         # stored metadata can never disagree with the real position.
         planning: list[PlanningState] = [PlanningState.from_env(env)]
+        records: list[RootSearchRecord] = []
 
         done = False
         while not done:
@@ -283,9 +317,13 @@ class MuZeroCollector:
             action = int(result.action)
             if not bool(mask[action]):
                 raise RuntimeError(f"search selected an invalid action {action}")
+            if self.config.capture_diagnostics:
+                records.append(self._root_record(result, encoded, mask, action))
 
             next_observation, reward, term, trunc, _step_info = env.step(env_action_index(action))
             next_encoded = self._encode(next_observation, builder, env)
+            if records:
+                records[-1].real_reward = float(reward)
 
             observations.append(next_encoded)
             actions.append(action)
@@ -338,12 +376,37 @@ class MuZeroCollector:
                 temperature=float(self.config.effective_temperature),
                 num_steps=len(actions),
                 training=bool(self.config.training),
+                network_version=int(self.config.network_version),
             ),
             extra={"planning_chain_disagreements": self._chain_disagreements(actions, planning)},
         )
         trajectory.validate()
         self.stats.trajectories += 1
-        return trajectory
+        return CollectedTrajectory(trajectory=trajectory, records=records)
+
+    def _root_record(
+        self, result: Any, observation: np.ndarray, mask: np.ndarray, action: int
+    ) -> RootSearchRecord:
+        """Noise-free network prior + MCTS outcome for one real decision."""
+        with torch.no_grad():
+            output = self.model.initial_inference(observation, mask)
+            prior = torch.softmax(apply_action_mask(output.policy_logits, mask), dim=-1)[0]
+        visits = np.asarray(result.visit_counts, dtype=np.float64)
+        total = float(visits.sum())
+        policy = visits / total if total > 0.0 else np.full_like(visits, 0.0)
+        diagnostics = result.diagnostics
+        return RootSearchRecord(
+            prior=prior.detach().cpu().numpy().astype(np.float64),
+            visits=visits,
+            policy=policy,
+            q_values=np.asarray(diagnostics.q_values, dtype=np.float64),
+            predicted_rewards=np.asarray(diagnostics.predicted_rewards, dtype=np.float64),
+            mask=np.asarray(mask, dtype=bool).copy(),
+            action=int(action),
+            network_value=float(diagnostics.root_predicted_value),
+            search_value=float(result.root_value),
+            tree_depth=int(diagnostics.tree_depth),
+        )
 
     @staticmethod
     def _chain_disagreements(actions: list[int], planning: list[PlanningState]) -> int:
@@ -396,6 +459,12 @@ class MuZeroCollector:
             trajectories.append(self.collect_trajectory(self._episode_index))
             self._episode_index += 1
         return trajectories
+
+    def collect_next_with_diagnostics(self) -> CollectedTrajectory:
+        """Collect the next episode (advancing the counter) with its search trace."""
+        collected = self.collect_with_diagnostics(self._episode_index)
+        self._episode_index += 1
+        return collected
 
     def collect_into(
         self,

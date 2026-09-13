@@ -65,6 +65,9 @@ class TrajectoryMetadata:
     temperature: float
     num_steps: int
     training: bool
+    #: Integrated-loop model version used for the searches in this trajectory
+    #: (Stage 4.5).  Staleness is ``current_version - network_version``.
+    network_version: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +84,7 @@ class TrajectoryMetadata:
             "temperature": self.temperature,
             "num_steps": self.num_steps,
             "training": self.training,
+            "network_version": self.network_version,
         }
 
 

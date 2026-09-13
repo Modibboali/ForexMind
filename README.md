@@ -921,6 +921,39 @@ tests/                     # Phase 3 tests (SAC, workers, data, eval, repro)
 
 ## 25. Phase 3 known limitations
 
+## 26. MuZero integrated training (Stage 4.5)
+
+The MuZero loop is runnable end to end:
+
+```bash
+python -m forexmind.muzero.train_muzero --max-env-steps 4096
+python -m forexmind.muzero.train_muzero --max-env-steps 200000 \
+    --num-simulations 32 --batch-size 64 --output-dir runs/muzero
+python -m forexmind.muzero.train_muzero --resume runs/muzero/latest.pt
+```
+
+`MuZeroTrainer` collects real TRAIN trajectories with MCTS (Dirichlet noise on,
+temperature > 0), stores them in the Stage 4.3 trajectory replay (uniform
+sampling, FIFO bounded), trains the jointly optimized Stage 4.4 learner from that
+replay, and lets the next search use the updated weights. Warm-up
+(`min_replay_transitions_before_training`), the collect/learn ratio
+(`trajectories_per_iteration` vs `learner_updates_per_iteration`) and the
+temperature schedule are explicit configuration; every trajectory records the
+`network_version` that produced it.
+
+Validation is the same corrected independent-episode pipeline PPO uses
+(`VALIDATION` split, Dirichlet noise off, temperature 0, non-overlapping specs)
+and the same selection metric, `mean_episode_log_return`. Checkpoints are
+written as `latest.pt`, `best.pt` and `step_<env_steps>.pt`, with the replay
+stored separately as shards so that `--resume` restores it instead of silently
+starting empty. Search-vs-prior diagnostics (argmax changes, KL, visit entropy,
+tree depth, root values, reward-model error, HOLD share, mask legality) and
+replay staleness are reported separately from learner losses.
+
+See [Stage 4.5 report](docs/stage45_muzero_training.md) for the measured
+512-step experiment (loss trends, search diagnostics, timing split) and the
+honest reading of what it does and does not demonstrate yet.
+
 - The replay buffer is **not** persisted in checkpoints (kept small); a resumed
   run starts with an empty buffer and refills it. Only buffer metadata is saved.
 - Resume restores learner parameters, optimizer state, counters, validation
