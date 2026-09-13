@@ -182,6 +182,8 @@ class MuZeroSample:
     value_masks: np.ndarray
     reward_masks: np.ndarray
     action_masks: np.ndarray
+    #: Split of the source trajectory; the learner refuses anything but "train".
+    split: str = "train"
 
     def validate(self) -> None:
         if self.observation.ndim != 1:
@@ -238,8 +240,10 @@ class MuZeroBatch:
     value_masks: torch.Tensor
     reward_masks: torch.Tensor
     action_masks: torch.Tensor
-    trajectory_ids: torch.Tensor
-    positions: torch.Tensor
+    trajectory_ids: torch.Tensor  # [B]
+    positions: torch.Tensor  # [B]
+    #: Split name of every row's source trajectory (dataset-leakage guard).
+    splits: tuple[str, ...] = ()
 
     @property
     def batch_size(self) -> int:
@@ -289,6 +293,7 @@ class MuZeroBatch:
                 "positions",
             )
         }
+        moved["splits"] = self.splits
         return MuZeroBatch(**moved)
 
 
@@ -355,6 +360,7 @@ def build_unroll_sample(
         value_masks=value_masks,
         reward_masks=reward_masks,
         action_masks=action_masks,
+        split=str(trajectory.metadata.split),
     )
     sample.validate()
     return sample
@@ -386,6 +392,7 @@ def collate_samples(
         action_masks=stack("action_masks", torch.bool),
         trajectory_ids=torch.as_tensor([s.trajectory_id for s in samples], dtype=torch.int64),
         positions=torch.as_tensor([s.position for s in samples], dtype=torch.int64),
+        splits=tuple(s.split for s in samples),
     )
     if device is not None:
         batch = batch.to(device)

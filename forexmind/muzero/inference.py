@@ -39,7 +39,34 @@ from forexmind.muzero.networks import (
 from forexmind.muzero.support import support_to_scalar
 from forexmind.muzero.types import NetworkOutput
 
-__all__ = ["MuZeroNetwork", "apply_action_mask", "build_muzero_network", "masked_policy_probs"]
+__all__ = [
+    "MuZeroNetwork",
+    "apply_action_mask",
+    "build_muzero_network",
+    "decode_scalar",
+    "masked_policy_probs",
+]
+
+
+def decode_scalar(
+    raw: torch.Tensor,
+    *,
+    use_support: bool,
+    support_size: int,
+    scale: float,
+    epsilon: float,
+) -> torch.Tensor:
+    """Decode a reward/value head output into economic units ``[..., 1]``.
+
+    Shared by inference and by the Stage 4.4 learner so training-time and
+    inference-time predictions are decoded identically.
+    """
+    if use_support:
+        scalar = support_to_scalar(raw, support_size, scale=scale, epsilon=epsilon)
+        return scalar.unsqueeze(-1)
+    if raw.shape[-1] != 1:
+        raise ValueError(f"scalar head must output 1 value, got {raw.shape[-1]}")
+    return raw * scale
 
 
 def apply_action_mask(
@@ -162,7 +189,7 @@ class MuZeroNetwork(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Turn a reward/value head output into ``(scalar [B, 1], logits or None)``."""
         if self.config.use_support:
-            scalar = support_to_scalar(raw, support_size, epsilon=epsilon) * scale
+            scalar = support_to_scalar(raw, support_size, scale=scale, epsilon=epsilon)
             return scalar.unsqueeze(-1), raw
         if raw.shape[-1] != 1:
             raise ValueError(f"{name} scalar head must output 1 value, got {raw.shape[-1]}")

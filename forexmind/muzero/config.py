@@ -72,10 +72,16 @@ class MuZeroConfig:
     value_support_size / reward_support_size:
         Number of support bins (must be odd so a symmetric centre exists).
     value_scale / reward_scale:
-        Multiply the decoded scalar to recover the natural target scale.
+        Characteristic magnitude of the target.  ``target / scale`` is mapped
+        into the ``[-1, 1]`` support window, so the representable range is
+        ``+-3 * scale`` (see :mod:`forexmind.muzero.support`).  Calibrate from
+        observed target statistics instead of guessing.
     value_epsilon / reward_epsilon:
-        Epsilon of the invertible support transform (0.001 matches MuZero;
-        ``0.0`` reduces it to the identity for an exact round trip).
+        Linear term of the MuZero scalar transform::
+
+            h(x) = sign(x) * (sqrt(|x| + 1) - 1) + epsilon * x
+
+        ``0.0`` (the default) uses the exact closed-form inverse.
     """
 
     obs_dim: int
@@ -92,8 +98,8 @@ class MuZeroConfig:
     reward_support_size: int = 21
     value_scale: float = 1.0
     reward_scale: float = 1.0
-    value_epsilon: float = 0.001
-    reward_epsilon: float = 0.001
+    value_epsilon: float = 0.0
+    reward_epsilon: float = 0.0
 
     def __post_init__(self) -> None:
         if self.obs_dim <= 0:

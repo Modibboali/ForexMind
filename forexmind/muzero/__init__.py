@@ -39,13 +39,32 @@ from forexmind.muzero.actions import (
     mu_zero_action_index,
     project_action_mask,
 )
+from forexmind.muzero.calibration import (
+    TargetStatistics,
+    calibration_report,
+    describe_targets,
+    propose_scale,
+)
 from forexmind.muzero.collector import CollectionStats, CollectorConfig, MuZeroCollector
 from forexmind.muzero.config import MuZeroConfig, SearchConfig, observation_dim
 from forexmind.muzero.inference import (
     MuZeroNetwork,
     apply_action_mask,
     build_muzero_network,
+    decode_scalar,
     masked_policy_probs,
+)
+from forexmind.muzero.learner import (
+    LearnerConfig,
+    MuZeroLearner,
+    OptimizerConfig,
+    check_batch_shapes,
+)
+from forexmind.muzero.losses import (
+    LossConfig,
+    MuZeroLossResult,
+    MuZeroPrediction,
+    muzero_losses,
 )
 from forexmind.muzero.minmax import MinMaxStats
 from forexmind.muzero.networks import (
@@ -68,7 +87,14 @@ from forexmind.muzero.search import (
     discounted_backup,
     visit_count_policy,
 )
-from forexmind.muzero.support import scalar_to_support, support_to_scalar
+from forexmind.muzero.support import (
+    SUPPORT_RANGE,
+    inverse_transform_to_scalar,
+    saturation_fraction,
+    scalar_to_support,
+    support_to_scalar,
+    transform_to_scalar,
+)
 from forexmind.muzero.targets import (
     MuZeroBatch,
     MuZeroSample,
@@ -90,19 +116,26 @@ __all__ = [
     "MUZERO_NUM_ACTIONS",
     "MUZERO_TARGET_EXPOSURES",
     "SAMPLING_STRATEGIES",
+    "SUPPORT_RANGE",
     "CollectionStats",
     "CollectorConfig",
     "DynamicsNetwork",
+    "LearnerConfig",
+    "LossConfig",
     "MinMaxStats",
     "MuZeroBatch",
     "MuZeroCollector",
     "MuZeroConfig",
+    "MuZeroLearner",
+    "MuZeroLossResult",
     "MuZeroMCTS",
     "MuZeroNetwork",
+    "MuZeroPrediction",
     "MuZeroSample",
     "MuZeroTrajectory",
     "NetworkOutput",
     "Node",
+    "OptimizerConfig",
     "PlanningState",
     "PredictionNetwork",
     "ReplayConfig",
@@ -111,23 +144,33 @@ __all__ = [
     "SearchDiagnostics",
     "SearchResult",
     "TargetConfig",
+    "TargetStatistics",
     "TrajectoryMetadata",
     "TrajectoryReplayBuffer",
     "apply_action_mask",
     "build_muzero_network",
     "build_unroll_sample",
+    "calibration_report",
+    "check_batch_shapes",
     "collate_samples",
     "count_parameters",
+    "decode_scalar",
+    "describe_targets",
     "discounted_backup",
     "env_action_index",
+    "inverse_transform_to_scalar",
     "masked_policy_probs",
     "model_version",
     "mu_zero_action_index",
+    "muzero_losses",
     "observation_dim",
     "parameter_report",
     "project_action_mask",
+    "propose_scale",
+    "saturation_fraction",
     "scalar_to_support",
     "support_to_scalar",
+    "transform_to_scalar",
     "value_target",
     "visit_count_policy",
 ]

@@ -377,12 +377,67 @@ batch = replay.sample(8, target_config=TargetConfig(num_unroll_steps=5, td_steps
 python -m tools.collect_muzero_trajectories --trajectories 4 --horizon 16 --simulations 8
 ```
 
+### MuZero loss, recurrent-unroll training, and learner (Stage 4.4)
+
+`MuZeroLearner` owns a **single** optimizer over the representation, dynamics and
+prediction networks. `learner.unroll(batch)` runs `initial_inference` plus `K`
+recurrent steps keeping gradients, and `learner.train_step(batch)` computes the
+masked objective
+
+```
+L = c_pi * L_policy + c_v * L_value + c_r * L_reward
+```
+
+where `L_policy` is a masked cross-entropy against the search visit-count policy,
+and `L_value` / `L_reward` are cross-entropies against two-hot support targets
+(`LossConfig`/`muzero_losses`). Each term is normalized by its own count of valid
+targets, so padding never dilutes a loss. Target policies are rejected if they
+place mass on an invalid action.
+
+Support (categorical) heads are the default, with the scale calibrated from the
+data rather than hard-coded: `forexmind.muzero.calibration.propose_scale` places
+the 99th percentile of `|target|` at `u = 0.6`, which for real Forex replay gives
+`reward_scale ≈ 2.4e-4` and `value_scale ≈ 0.29` — the default `1.0` would have
+put every reward in the centre bin.
+
+Gradients flow through the whole unroll, with an opt-in damping gate
+(`LearnerConfig.latent_gradient_scale`, default `0.5`) applied after every
+recurrent transition except the last, so every step still contributes while the
+backward path into earlier steps is reduced. `1.0` disables it exactly. There is
+no target network, and the learner refuses to train on non-TRAIN trajectories
+unless explicitly told otherwise. Checkpoints store model + optimizer + counters +
+RNG + architecture (replay metadata only, not the buffer).
+
+```python
+from forexmind.muzero import LearnerConfig, MuZeroLearner, OptimizerConfig
+from forexmind.muzero.calibration import calibration_report
+
+report = calibration_report(batch)                      # scales from the data
+learner = MuZeroLearner(model, LearnerConfig.for_model(model.config))
+metrics = learner.train_step(batch)                     # unroll -> loss -> step
+learner.save_checkpoint("runs/muzero_stage44.pt")
+```
+
+```powershell
+python -m tools.calibrate_muzero_targets
+python -m tools.smoke_muzero_learning --updates 200 --batch-size 32
+python -m tools.benchmark_muzero_learning --batch-sizes 32 64 128 256
+```
+
+On the real TRAIN replay (6 trajectories, `K = 5`, 200 updates, batch 32) the
+total loss falls 5.52 -> 2.34 (-57.5%), policy KL 0.376 -> 0.076, value MAE
+0.168 -> 0.011, reward MAE 1.46e-04 -> 1.59e-05, with no non-finite values and no
+HOLD collapse. A checkpoint reload reproduces the probe unroll bit-for-bit.
+
 See [Stage 4.1 report](docs/stage41_muzero_networks.md) for the network shapes
 and inference throughput, [Stage 4.2 report](docs/stage42_muzero_search.md) for
 the search architecture, PUCT equation, backup semantics, masking, and
-search-cost curve, and
-[Stage 4.3 report](docs/stage43_muzero_replay.md) for the trajectory contract,
-target equations, replay architecture, and real-data collection results.
+search-cost curve, [Stage 4.3 report](docs/stage43_muzero_replay.md) for the
+trajectory contract, target equations, replay architecture, and real-data
+collection results, and [Stage 4.4 report](docs/stage44_muzero_learner.md) for
+the loss equations, the support transform, gradient-scaling design,
+overfit/sanity evidence, real-data smoke training, throughput, and checkpoint
+semantics.
 
 ---
 ## 8. Reward

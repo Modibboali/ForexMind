@@ -53,6 +53,7 @@ def make_trajectory(
     discount: float = 0.99,
     temperature: float = 1.0,
     training: bool = True,
+    observation_tag: float = 0.0,
 ) -> MuZeroTrajectory:
     """Build a valid trajectory from explicit actions/rewards.
 
@@ -67,6 +68,10 @@ def make_trajectory(
     observations = np.zeros((steps + 1, obs_dim), dtype=np.float32)
     for i in range(steps + 1):
         observations[i, 0] = float(i)
+        if obs_dim > 1:
+            # A per-trajectory marker so different trajectories are distinguishable
+            # from their observations alone (needed by the value/policy sanity tests).
+            observations[i, 1] = observation_tag
 
     if action_masks is None:
         planning = [PlanningState(exposure=initial_exposure, is_flat=initial_is_flat)]
