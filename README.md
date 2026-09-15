@@ -976,3 +976,83 @@ honest reading of what it does and does not demonstrate yet.
   session (e.g. Kaggle) keep `num_workers` small (2–4) and `total_env_steps`
   modest for a first run; each worker re-imports torch and loads the parquet
   dataset, so hundreds of workers will OOM the session.
+
+## 27. Scaled MuZero collection and batched inference (Stage 4.6)
+
+Collection can now run on many CPU workers with batched MCTS inference:
+
+```bash
+# 4 collector processes x 4 concurrent searches each, local batched inference
+python -m forexmind.muzero.train_muzero --max-env-steps 200000 \
+    --num-collectors 16 --collectors-per-worker 4 --inference-mode local
+
+# central batched inference service (the design for a single-GPU machine)
+python -m forexmind.muzero.train_muzero --max-env-steps 200000 \
+    --num-collectors 8 --collectors-per-worker 2 --inference-mode server \
+    --max-inference-batch-size 32 --max-batch-wait-ms 2
+
+# benchmarks and profiling
+python -m tools.benchmark_muzero_scaling --workers 1 2 4 8
+python -m tools.benchmark_muzero_scaling --workers 4 --simulations 8 16 32 64
+python -m tools.profile_muzero_phases --max-env-steps 512 --num-collectors 8
+python -m tools.benchmark_muzero_replay
+python -m tools.smoke_muzero_parallel --workers 2 --collectors-per-worker 2
+```
+
+`num_collectors <= 1` is exactly the Stage 4.5 single-process loop. With more
+collectors, `MuZeroCollectorPool` spawns workers (each owning its environments,
+RNG streams and MCTS trees), a bounded trajectory queue provides backpressure, a
+single writer thread inserts into the Stage 4.3 replay under the same lock the
+learner samples with, and `MuZeroMCTS.search_batch` drives several roots in
+lock-step so their leaf transitions share one inference call. Weights are
+published to inference atomically on a configurable schedule
+(`sync_every_learner_updates`), every trajectory records the network version
+that produced it (staleness diagnostics), and worker/inference failures raise
+instead of deadlocking. `target_updates_per_env_step` keeps the
+learner/environment ratio fixed when collectors are added.
+
+Measured on this machine (4 physical cores, CPU-only, 3 instruments, horizon 16,
+16 simulations): collection goes from **15.3 env steps/s** single-process to
+**78.0 env steps/s** with 32 collectors (5.1x), and the batched inference
+service reaches **63.5 env steps/s**. Search results are unchanged - batch-1
+search is bit-identical to Stage 4.2 search, and a pooled worker reproduces the
+single-process collector action-for-action given the same weights and seeds.
+See [Stage 4.6 report](docs/stage46_muzero_scaling.md) for the full tables, the
+phase profile (per-call inference dispatch and replay sampling are the real
+bottlenecks, not the environment) and the recommended worker/simulation counts.
+
+## 28. Vectorized replay, evaluation tiers and the first serious run (Stage 4.7)
+
+Replay target construction was rebuilt on a packed array layout and is now
+bit-identical to the Stage 4.3 reference sampler but **108x faster at batch 32**
+(364x at batch 256), which removes replay sampling as a co-bottleneck. The
+reference path is retained (`batch_backend="reference"`) and the two are
+compared tensor-by-tensor in `tests/test_muzero_vectorized_replay.py`.
+
+```bash
+# the packed sampler is the default; the reference stays available for checks
+python -m forexmind.muzero.train_muzero --max-env-steps 20000 --batch-backend vectorized
+
+# two evaluation tiers: quick monitoring + full validation, with cost accounting
+python -m forexmind.muzero.train_muzero --max-env-steps 20000 \
+    --eval-every-env-steps 10000 --eval-episodes 10 --eval-horizon 64 \
+    --full-eval-every-env-steps 25000 --full-eval-episodes 32 --full-eval-horizon 256 \
+    --full-eval-at-end --num-collectors 16 --collectors-per-worker 4 \
+    --inference-mode local --num-simulations 32
+
+# replay benchmark with the old-vs-new table and phase breakdown, and the
+# analysis tool (curves, 0/8/16/32 simulations, checkpoints, baselines)
+python -m tools.benchmark_muzero_replay
+python -m tools.analyze_muzero_run --run-dir data/reports/stage47_muzero_run
+```
+
+Every run now writes `training_log.csv` (losses, per-unroll-step errors,
+entropies, HOLD behaviour, replay composition, staleness) every 10 iterations,
+aborts on non-finite losses/latents/diagnostics, and keeps `best.pt` tied to the
+full-validation score. The first serious run (20k environment steps, 32
+simulations, 16 collectors) is reported in
+[Stage 4.7 report](docs/stage47_muzero_experiment.md): the model learns its
+reward/value/policy targets well, but search adds no measurable validation
+improvement over the raw network and full validation degraded between the 10k
+and 20k checkpoints while replay staleness grew to ~81 network versions - the
+measured case for reanalysis next.

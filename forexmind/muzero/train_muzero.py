@@ -1,4 +1,4 @@
-"""Integrated MuZero training launcher (Stage 4.5).
+"""Integrated MuZero training launcher (Stage 4.5, scaled in Stage 4.6).
 
 Usage (from the repository root)::
 
@@ -6,6 +6,8 @@ Usage (from the repository root)::
     python -m forexmind.muzero.train_muzero --max-env-steps 200000 \
         --num-simulations 32 --batch-size 64 --output-dir runs/muzero
     python -m forexmind.muzero.train_muzero --resume runs/muzero/latest.pt
+    python -m forexmind.muzero.train_muzero --max-env-steps 200000 \
+        --num-collectors 16 --collectors-per-worker 2 --inference-mode server
 
 Everything economic is frozen: the same processed dataset, the same TRAIN /
 VALIDATION / TEST splits, the same ten-action environment and the same
@@ -29,7 +31,8 @@ from forexmind.config import (
 )
 from forexmind.muzero.trainer import MuZeroTrainer, MuZeroTrainingConfig
 from forexmind.observation.encoder import EncoderConfig
-from forexmind.training.data import DEFAULT_PROCESSED_DIR, make_training_dataset
+from forexmind.training.data import DEFAULT_PROCESSED_DIR
+from forexmind.training.dataset_mmap import resolve_dataset
 
 DEFAULT_INSTRUMENTS = ("EURUSD", "GBPUSD", "USDJPY")
 
@@ -81,6 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
     # replay
     parser.add_argument("--max-trajectories", type=int, default=128)
     parser.add_argument("--max-transitions", type=int, default=None)
+    parser.add_argument(
+        "--batch-backend",
+        default="vectorized",
+        choices=["vectorized", "reference"],
+        help="replay target construction backend (Stage 4.7)",
+    )
 
     # validation / checkpointing
     parser.add_argument("--max-env-steps", type=int, default=2_048)
@@ -90,6 +99,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-seed", type=int, default=42)
     parser.add_argument("--checkpoint-every-env-steps", type=int, default=1_024)
     parser.add_argument("--progress-every-iterations", type=int, default=1)
+
+    # evaluation tiers (Stage 4.7)
+    parser.add_argument(
+        "--full-eval-every-env-steps",
+        type=int,
+        default=0,
+        help="Tier B (full) validation interval; 0 disables it during training",
+    )
+    parser.add_argument("--full-eval-episodes", type=int, default=100)
+    parser.add_argument("--full-eval-horizon", type=int, default=512)
+    parser.add_argument("--full-eval-seed", type=int, default=4_242)
+    parser.add_argument(
+        "--full-eval-at-end",
+        action="store_true",
+        help="run one full validation when training finishes (Stage 4.7 S35)",
+    )
+    parser.add_argument("--training-log-name", default="training_log")
+
+    # parallel collection / batched inference (Stage 4.6)
+    parser.add_argument("--num-collectors", type=int, default=1)
+    parser.add_argument("--collectors-per-worker", type=int, default=2)
+    parser.add_argument("--inference-mode", default="server", choices=["server", "local"])
+    parser.add_argument("--inference-device", default=None)
+    parser.add_argument("--max-inference-batch-size", type=int, default=32)
+    parser.add_argument("--max-batch-wait-ms", type=float, default=2.0)
+    parser.add_argument("--trajectory-queue-size", type=int, default=8)
+    parser.add_argument("--sync-every-learner-updates", type=int, default=1)
+    parser.add_argument("--torch-threads-per-worker", type=int, default=1)
+    parser.add_argument("--dataset-backend", default="auto", choices=["auto", "parquet", "mmap"])
+    parser.add_argument("--target-updates-per-env-step", type=float, default=None)
+    parser.add_argument("--profile", action="store_true", help="enable phase profiling (S2)")
 
     # environment (unchanged economics)
     parser.add_argument("--spread", type=float, default=0.0002)
@@ -127,6 +167,7 @@ def build_config(args: argparse.Namespace) -> MuZeroTrainingConfig:
         use_support=not args.scalar,
         max_trajectories=args.max_trajectories,
         max_transitions=args.max_transitions,
+        batch_backend=args.batch_backend,
         max_env_steps=args.max_env_steps,
         eval_every_env_steps=args.eval_every_env_steps,
         eval_episodes=args.eval_episodes,
@@ -136,6 +177,25 @@ def build_config(args: argparse.Namespace) -> MuZeroTrainingConfig:
         output_dir=args.output_dir,
         seed=args.seed,
         progress_every_iterations=args.progress_every_iterations,
+        num_collectors=args.num_collectors,
+        collectors_per_worker=args.collectors_per_worker,
+        inference_mode=args.inference_mode,
+        inference_device=args.inference_device,
+        max_inference_batch_size=args.max_inference_batch_size,
+        max_batch_wait_ms=args.max_batch_wait_ms,
+        trajectory_queue_size=args.trajectory_queue_size,
+        sync_every_learner_updates=args.sync_every_learner_updates,
+        torch_threads_per_worker=args.torch_threads_per_worker,
+        dataset_backend=args.dataset_backend,
+        processed_dir=args.processed_dir,
+        target_updates_per_env_step=args.target_updates_per_env_step,
+        profile=args.profile,
+        full_eval_every_env_steps=args.full_eval_every_env_steps,
+        full_eval_episodes=args.full_eval_episodes,
+        full_eval_horizon=args.full_eval_horizon,
+        full_eval_seed=args.full_eval_seed,
+        full_eval_at_end=args.full_eval_at_end,
+        training_log_name=args.training_log_name,
     )
 
 
@@ -151,7 +211,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = build_config(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = make_training_dataset(args.processed_dir, instruments=tuple(args.instruments))
+    dataset, dataset_backend = resolve_dataset(
+        processed_dir=args.processed_dir,
+        instruments=tuple(args.instruments),
+        backend=args.dataset_backend,
+    )
     trainer = MuZeroTrainer(
         dataset,
         _env_config(args.spread, args.leverage),
@@ -159,12 +223,22 @@ def main(argv: list[str] | None = None) -> int:
         config,
         device=device,
     )
-    print(f"MuZero integrated training | device={device} | {trainer.model.parameter_report()}")
+    mode = (
+        f"parallel {config.num_workers}w x {config.collectors_per_worker}c "
+        f"({config.inference_mode} inference)"
+        if config.parallel_collection
+        else "single process"
+    )
+    print(
+        f"MuZero integrated training | device={device} | dataset={dataset_backend} | "
+        f"collection={mode} | {trainer.model.parameter_report()}"
+    )
     if args.resume is not None:
         print(f"resuming from {args.resume}: {trainer.resume(args.resume)}")
     report = trainer.train()
     path = trainer.write_report()
     print(f"report written to {path}")
+    print(f"training log written to {trainer.write_training_log()}")
     print(f"final: {report['counters']}")
     return 0
 

@@ -54,6 +54,7 @@ import numpy as np
 import torch
 
 from forexmind.muzero.actions import MUZERO_NUM_ACTIONS
+from forexmind.muzero.profiling import PhaseTimer, phase
 from forexmind.muzero.trajectory import MuZeroTrajectory
 
 __all__ = [
@@ -301,11 +302,16 @@ def build_unroll_sample(
     trajectory: MuZeroTrajectory,
     position: int,
     config: TargetConfig,
+    *,
+    timer: PhaseTimer | None = None,
 ) -> MuZeroSample:
     """Build the unroll sample for real position ``position``.
 
     Pads with loss masks near the end of the trajectory (preferred over
     rejecting near-terminal states) and never crosses into another trajectory.
+
+    ``timer`` is optional Stage 4.7 instrumentation (brief S3): it is a no-op
+    unless a profiling run enables it.
     """
     trajectory.validate()
     steps = len(trajectory)
@@ -313,61 +319,77 @@ def build_unroll_sample(
         raise IndexError(f"position {position} out of range [0, {steps})")
 
     k = config.num_unroll_steps
-    actions = np.full(k, PAD_ACTION, dtype=np.int64)
-    target_rewards = np.zeros(k, dtype=np.float32)
-    reward_masks = np.zeros(k, dtype=np.float32)
-    target_values = np.zeros(k + 1, dtype=np.float32)
-    target_policies = np.zeros((k + 1, MUZERO_NUM_ACTIONS), dtype=np.float32)
-    policy_masks = np.zeros(k + 1, dtype=np.float32)
-    value_masks = np.zeros(k + 1, dtype=np.float32)
-    action_masks = np.tile(PAD_ACTION_MASK, (k + 1, 1))
+    with phase(timer, "padding_mask_construction"):
+        actions = np.full(k, PAD_ACTION, dtype=np.int64)
+        target_rewards = np.zeros(k, dtype=np.float32)
+        reward_masks = np.zeros(k, dtype=np.float32)
+        target_values = np.zeros(k + 1, dtype=np.float32)
+        target_policies = np.zeros((k + 1, MUZERO_NUM_ACTIONS), dtype=np.float32)
+        policy_masks = np.zeros(k + 1, dtype=np.float32)
+        value_masks = np.zeros(k + 1, dtype=np.float32)
+        action_masks = np.tile(PAD_ACTION_MASK, (k + 1, 1))
 
-    for offset in range(k):
-        j = position + offset
-        if j >= steps:
-            break  # padded: losses stay masked, padding action is never trained
-        actions[offset] = int(trajectory.actions[j])
-        target_rewards[offset] = float(trajectory.rewards[j])
-        reward_masks[offset] = 1.0
+    with phase(timer, "action_reward_gather"):
+        for offset in range(k):
+            j = position + offset
+            if j >= steps:
+                break  # padded: losses stay masked, padding action is never trained
+            actions[offset] = int(trajectory.actions[j])
+            target_rewards[offset] = float(trajectory.rewards[j])
+            reward_masks[offset] = 1.0
 
-    for offset in range(k + 1):
-        index = position + offset
-        if index > steps:
-            break
-        value_masks[offset] = 1.0
-        target_values[offset] = value_target(
-            trajectory,
-            index,
-            td_steps=config.td_steps,
-            discount=config.discount,
-            use_boundary_value=config.use_boundary_value,
+    with phase(timer, "policy_gather"):
+        for offset in range(k + 1):
+            index = position + offset
+            if index > steps:
+                break
+            value_masks[offset] = 1.0
+            if index < steps:
+                action_masks[offset] = trajectory.action_masks[index]
+                if not state_is_terminal(trajectory, index):
+                    target_policies[offset] = trajectory.root_policies[index]
+                    policy_masks[offset] = 1.0
+
+    with phase(timer, "value_target_construction"):
+        for offset in range(k + 1):
+            index = position + offset
+            if index > steps:
+                break
+            target_values[offset] = value_target(
+                trajectory,
+                index,
+                td_steps=config.td_steps,
+                discount=config.discount,
+                use_boundary_value=config.use_boundary_value,
+            )
+
+    with phase(timer, "observation_gather"):
+        observation = np.asarray(trajectory.observations[position], dtype=np.float32)
+
+    with phase(timer, "sample_validation"):
+        sample = MuZeroSample(
+            trajectory_id=int(trajectory.metadata.trajectory_id),
+            position=int(position),
+            observation=observation,
+            actions=actions,
+            target_rewards=target_rewards,
+            target_values=target_values,
+            target_policies=target_policies,
+            policy_masks=policy_masks,
+            value_masks=value_masks,
+            reward_masks=reward_masks,
+            action_masks=action_masks,
+            split=str(trajectory.metadata.split),
         )
-        if index < steps:
-            action_masks[offset] = trajectory.action_masks[index]
-            if not state_is_terminal(trajectory, index):
-                target_policies[offset] = trajectory.root_policies[index]
-                policy_masks[offset] = 1.0
-
-    sample = MuZeroSample(
-        trajectory_id=int(trajectory.metadata.trajectory_id),
-        position=int(position),
-        observation=np.asarray(trajectory.observations[position], dtype=np.float32),
-        actions=actions,
-        target_rewards=target_rewards,
-        target_values=target_values,
-        target_policies=target_policies,
-        policy_masks=policy_masks,
-        value_masks=value_masks,
-        reward_masks=reward_masks,
-        action_masks=action_masks,
-        split=str(trajectory.metadata.split),
-    )
-    sample.validate()
+        sample.validate()
     return sample
 
 
 def collate_samples(
-    samples: list[MuZeroSample], *, device: torch.device | str | None = None
+    samples: list[MuZeroSample],
+    *,
+    device: torch.device | str | None = None,
+    timer: PhaseTimer | None = None,
 ) -> MuZeroBatch:
     """Stack unroll samples into a :class:`MuZeroBatch` of torch tensors."""
     if not samples:
@@ -380,20 +402,21 @@ def collate_samples(
         array = np.stack([getattr(sample, field) for sample in samples], axis=0)
         return torch.as_tensor(np.ascontiguousarray(array), dtype=dtype)
 
-    batch = MuZeroBatch(
-        observation=stack("observation", torch.float32),
-        actions=stack("actions", torch.int64),
-        target_rewards=stack("target_rewards", torch.float32),
-        target_values=stack("target_values", torch.float32),
-        target_policies=stack("target_policies", torch.float32),
-        policy_masks=stack("policy_masks", torch.float32),
-        value_masks=stack("value_masks", torch.float32),
-        reward_masks=stack("reward_masks", torch.float32),
-        action_masks=stack("action_masks", torch.bool),
-        trajectory_ids=torch.as_tensor([s.trajectory_id for s in samples], dtype=torch.int64),
-        positions=torch.as_tensor([s.position for s in samples], dtype=torch.int64),
-        splits=tuple(s.split for s in samples),
-    )
+    with phase(timer, "batch_stacking"):
+        batch = MuZeroBatch(
+            observation=stack("observation", torch.float32),
+            actions=stack("actions", torch.int64),
+            target_rewards=stack("target_rewards", torch.float32),
+            target_values=stack("target_values", torch.float32),
+            target_policies=stack("target_policies", torch.float32),
+            policy_masks=stack("policy_masks", torch.float32),
+            value_masks=stack("value_masks", torch.float32),
+            reward_masks=stack("reward_masks", torch.float32),
+            action_masks=stack("action_masks", torch.bool),
+            trajectory_ids=torch.as_tensor([s.trajectory_id for s in samples], dtype=torch.int64),
+            positions=torch.as_tensor([s.position for s in samples], dtype=torch.int64),
+            splits=tuple(s.split for s in samples),
+        )
     if device is not None:
         batch = batch.to(device)
     return batch

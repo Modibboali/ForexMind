@@ -115,7 +115,7 @@ def make_trajectory(
         action_masks=masks,
         terminated=term,
         truncated=trunc,
-        planning_exposure=np.asarray([s.exposure for s in planning], dtype=np.float32),
+        planning_exposure=np.asarray([s.exposure for s in planning], dtype=np.float64),
         planning_is_flat=np.asarray([s.is_flat for s in planning], dtype=bool),
         boundary_value=float(boundary_value),
         metadata=TrajectoryMetadata(

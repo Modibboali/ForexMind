@@ -16,6 +16,7 @@ cross-episode Sharpe is never used for model selection.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from dataclasses import replace as _replace
 from typing import Any
 
 import numpy as np
@@ -61,6 +62,7 @@ class MuZeroAgent:
         name: str = "muzero_eval",
         device: str | torch.device = "cpu",
         capture_diagnostics: bool = True,
+        network_only: bool = False,
     ) -> None:
         config = search_config or SearchConfig()
         self.model = model
@@ -76,12 +78,19 @@ class MuZeroAgent:
         self.name = name
         self.device = torch.device(device)
         self.capture_diagnostics = capture_diagnostics
+        #: Stage 4.7 S26: "0 simulations" means act on the masked network prior
+        #: directly, with no search at all.
+        self.network_only = bool(network_only)
         self.records: list[RootSearchRecord] = []
         self.action_mask: np.ndarray | None = None
         self.last_action_index: int | None = None
         self.searches = 0
-        self._mcts = MuZeroMCTS(
-            model, self.search_config, rng=np.random.default_rng(self.search_config.seed)
+        self._mcts = (
+            None
+            if self.network_only
+            else MuZeroMCTS(
+                model, self.search_config, rng=np.random.default_rng(self.search_config.seed)
+            )
         )
 
     # -- TradingAgent protocol -------------------------------------------------
@@ -100,6 +109,36 @@ class MuZeroAgent:
         if mask is None:
             raise ValueError("MuZero evaluation requires the current environment action mask")
         encoded = np.asarray(observation.encoded, dtype=np.float32)
+        if self.network_only:
+            with torch.no_grad():
+                output = self.model.initial_inference(encoded, mask)
+                prior = torch.softmax(
+                    apply_action_mask(output.policy_logits, mask), dim=-1
+                )[0]
+            probabilities = prior.detach().cpu().numpy().astype(np.float64)
+            action = int(np.argmax(probabilities))
+            self.searches += 1
+            self.last_action_index = action
+            if self.capture_diagnostics:
+                visits = np.zeros(self.model.config.num_actions, dtype=np.float64)
+                visits[action] = float(self.search_config.num_simulations)
+                value = float(output.value.reshape(-1)[0])
+                self.records.append(
+                    RootSearchRecord(
+                        prior=probabilities,
+                        visits=visits,
+                        policy=visits / visits.sum(),
+                        q_values=np.zeros_like(visits),
+                        predicted_rewards=np.zeros_like(visits),
+                        mask=np.asarray(mask, dtype=bool).copy(),
+                        action=action,
+                        network_value=value,
+                        search_value=value,
+                        tree_depth=0,
+                    )
+                )
+            return resolve_action(env_action_index(action))
+        assert self._mcts is not None
         result = self._mcts.search(encoded, mask, add_root_noise=False)
         self.searches += 1
         action = int(result.action)
@@ -220,7 +259,15 @@ class MuZeroEvaluator:
         seed: int | None = None,
         episode_specs: list[EpisodeSpec] | None = None,
         capture_diagnostics: bool = True,
+        network_only: bool = False,
+        num_simulations: int | None = None,
     ) -> MuZeroEvaluation:
+        """Evaluate one model on fixed episodes.
+
+        ``network_only`` (Stage 4.7 S26) replaces search with the masked network
+        prior; ``num_simulations`` overrides the search budget for S27-style
+        comparisons without touching any other evaluation setting.
+        """
         specs = (
             episode_specs
             if episode_specs is not None
@@ -228,12 +275,18 @@ class MuZeroEvaluator:
         )
         if len(specs) != n_episodes or any(spec.split != split for spec in specs):
             raise ValueError("episode_specs must match split and requested episode count")
+        search_config = self.search_config
+        if num_simulations is not None and not network_only:
+            search_config = _replace(
+                search_config, num_simulations=max(1, int(num_simulations))
+            )
         agent = MuZeroAgent(
             model,
-            self.search_config,
+            search_config,
             name="muzero_eval",
             device=self.device,
             capture_diagnostics=capture_diagnostics,
+            network_only=network_only,
         )
         evaluation = self._runner.run_agent(agent, specs)
         trajectories = [

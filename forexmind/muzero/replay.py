@@ -33,7 +33,13 @@ import numpy as np
 import torch
 
 from forexmind.muzero.actions import FLAT, HOLD
-from forexmind.muzero.targets import MuZeroBatch, TargetConfig, build_unroll_sample, collate_samples
+from forexmind.muzero.packed_replay import (
+    PackedTrajectories,
+    build_vectorized_batch,
+    sample_reference,
+)
+from forexmind.muzero.profiling import PhaseTimer, phase
+from forexmind.muzero.targets import MuZeroBatch, TargetConfig
 from forexmind.muzero.trajectory import MuZeroTrajectory
 
 __all__ = [
@@ -57,6 +63,11 @@ class ReplayConfig:
     sampling: str = "uniform"
     decision_rich_weight: float = 0.0
     seed: int = 0
+    #: ``vectorized`` (Stage 4.7 default) builds a whole batch from a packed
+    #: array layout; ``reference`` keeps the Stage 4.3/4.6 per-sample Python
+    #: path.  Both must produce identical batches (see
+    #: ``tests/test_muzero_vectorized_replay.py``).
+    batch_backend: str = "vectorized"
 
     def __post_init__(self) -> None:
         if self.max_trajectories < 1:
@@ -72,6 +83,10 @@ class ReplayConfig:
             raise ValueError(
                 f"decision_rich_weight must be in [0, 1], got {self.decision_rich_weight}"
             )
+        if self.batch_backend not in ("vectorized", "reference"):
+            raise ValueError(
+                f"batch_backend must be 'vectorized' or 'reference', got {self.batch_backend!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -80,6 +95,7 @@ class ReplayConfig:
             "sampling": self.sampling,
             "decision_rich_weight": self.decision_rich_weight,
             "seed": self.seed,
+            "batch_backend": self.batch_backend,
         }
 
 
@@ -217,6 +233,7 @@ class TrajectoryReplayBuffer:
         self._trajectories: list[MuZeroTrajectory] = []
         self._offsets = np.zeros(0, dtype=np.int64)  # start of each trajectory's positions
         self._events: np.ndarray | None = None  # cached concatenated event flags
+        self._packed: PackedTrajectories | None = None  # Stage 4.7 packed view
         self._total_positions = 0
 
     # -- capacity -------------------------------------------------------------
@@ -269,6 +286,7 @@ class TrajectoryReplayBuffer:
         self._offsets = np.append(self._offsets, self._total_positions)
         self._total_positions += len(trajectory)
         self._events = None
+        self._packed = None
         self._evict()
 
     def _evict(self) -> None:
@@ -290,12 +308,26 @@ class TrajectoryReplayBuffer:
         self._offsets = offsets
         self._total_positions = running
         self._events = None
+        self._packed = None
 
     def clear(self) -> None:
         self._trajectories.clear()
         self._offsets = np.zeros(0, dtype=np.int64)
         self._total_positions = 0
         self._events = None
+        self._packed = None
+
+    # -- packed view (Stage 4.7) ----------------------------------------------
+
+    def packed(self) -> PackedTrajectories:
+        """Lazily built contiguous view of every stored trajectory.
+
+        Rebuilt only after the buffer changes, so its construction cost is
+        amortised over every batch sampled between two insertions.
+        """
+        if self._packed is None:
+            self._packed = PackedTrajectories.from_trajectories(self._trajectories)
+        return self._packed
 
     # -- position decoding ----------------------------------------------------
 
@@ -338,6 +370,8 @@ class TrajectoryReplayBuffer:
         decision_rich_weight: float | None = None,
         rng: np.random.Generator | None = None,
         device: torch.device | str | None = None,
+        batch_backend: str | None = None,
+        timer: PhaseTimer | None = None,
     ) -> MuZeroBatch:
         """Sample a training batch of unroll positions."""
         if batch_size < 1:
@@ -354,12 +388,28 @@ class TrajectoryReplayBuffer:
             else float(decision_rich_weight)
         )
         generator = rng if rng is not None else self._rng
-        pairs = SAMPLING_STRATEGIES[name](self, batch_size, generator, weight)
-        samples = [
-            build_unroll_sample(self._trajectories[traj_index], position, config)
-            for traj_index, position in pairs
-        ]
-        return collate_samples(samples, device=device)
+        with phase(timer, "trajectory_selection"):
+            pairs = SAMPLING_STRATEGIES[name](self, batch_size, generator, weight)
+        backend = batch_backend or self.config.batch_backend
+        if backend == "reference":
+            trajectory_index = np.asarray([pair[0] for pair in pairs], dtype=np.int64)
+            positions = np.asarray([pair[1] for pair in pairs], dtype=np.int64)
+            return sample_reference(
+                self._trajectories,
+                trajectory_index,
+                positions,
+                config,
+                device=device,
+                timer=timer,
+            )
+        if backend != "vectorized":
+            raise ValueError(f"unknown batch backend {backend!r}")
+        packed = self.packed()
+        trajectory_index = np.asarray([pair[0] for pair in pairs], dtype=np.int64)
+        positions = np.asarray([pair[1] for pair in pairs], dtype=np.int64)
+        return build_vectorized_batch(
+            packed, trajectory_index, positions, config, timer=timer, device=device
+        )
 
     # -- diagnostics ----------------------------------------------------------
 
@@ -417,6 +467,8 @@ class TrajectoryReplayBuffer:
             "total_mb": round(total_bytes / 1e6, 4),
             "bytes_per_trajectory": float(np.mean(per_trajectory)) if per_trajectory else 0.0,
             "bytes_per_transition": (total_bytes / transitions) if transitions else 0.0,
+            "packed_bytes": (self._packed.nbytes() if self._packed is not None else 0),
+            "packed": self._packed is not None,
             "capacity_used_fraction": (
                 self.num_trajectories / self.config.max_trajectories
                 if self.config.max_trajectories

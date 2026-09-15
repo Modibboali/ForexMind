@@ -100,7 +100,7 @@ class MuZeroTrajectory:
     action_masks: np.ndarray  # [T, 6]    bool
     terminated: np.ndarray  # [T]        bool (outcome of the transition at t)
     truncated: np.ndarray  # [T]        bool
-    planning_exposure: np.ndarray  # [T+1]      float32 (from the live account)
+    planning_exposure: np.ndarray  # [T+1]      float64 (from the live account)
     planning_is_flat: np.ndarray  # [T+1]      bool
     boundary_value: float
     metadata: TrajectoryMetadata

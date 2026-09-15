@@ -19,7 +19,11 @@ from forexmind.muzero.diagnostics import (
     staleness_summary,
 )
 from forexmind.muzero.replay_store import load_replay, replay_store_report, save_replay
-from forexmind.muzero.trainer import MuZeroTrainer, MuZeroTrainingConfig
+from forexmind.muzero.trainer import (
+    MuZeroTrainer,
+    MuZeroTrainingConfig,
+    NumericalCorruptionError,
+)
 from forexmind.observation.encoder import EncoderConfig
 
 from tests.synthetic import make_instrument, make_split_dataset, timeline_m5
@@ -373,3 +377,138 @@ def test_validation_uses_the_ppo_selection_metric(tmp_path) -> None:
     assert evaluation.score == pytest.approx(float(headline["mean_episode_log_return"]))
     steps = sum(t.n_steps for values in evaluation.trajectories.values() for t in values)
     assert evaluation.search["roots"] == pytest.approx(float(steps))
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4.7: evaluation tiers, training log, stop conditions
+# --------------------------------------------------------------------------- #
+
+
+def test_two_tier_evaluation_stays_separate_and_is_accounted(tmp_path) -> None:
+    trainer = _trainer(
+        tmp_path,
+        horizon=2,
+        num_simulations=2,
+        min_replay_transitions_before_training=2,
+        learner_updates_per_iteration=1,
+        max_env_steps=8,
+        eval_every_env_steps=4,
+        eval_episodes=2,
+        eval_horizon=4,
+        checkpoint_every_env_steps=4,
+        full_eval_episodes=3,
+        full_eval_horizon=6,
+        full_eval_seed=99,
+        full_eval_at_end=True,
+    )
+    report = trainer.train()
+    assert trainer.best_score is not None
+    assert trainer.best_full_score is not None
+    # The two tiers use different, but themselves fixed, episode specs (S15).
+    quick_specs = trainer.validation_specs
+    full_specs = trainer.full_validation_specs
+    assert quick_specs is not None and full_specs is not None
+    assert [s.to_dict() for s in quick_specs] != [s.to_dict() for s in full_specs]
+    full = report["full_validation"]
+    assert full["tier"] == "B" and full["ran"] is True
+    assert full["episodes"] == 3
+    assert full["headline"]["selection_metric_name"] == "mean_episode_log_return"
+    timing = report["timing"]
+    for key in (
+        "quick_evaluation_seconds",
+        "full_evaluation_seconds",
+        "checkpoint_seconds",
+        "validation_fraction",
+    ):
+        assert key in timing, key
+    assert timing["validation_fraction"] >= 0.0
+    # Re-running the same tier must reuse the identical specs (S15).
+    again = trainer.evaluate_full()
+    assert [s.to_dict() for s in trainer.full_validation_specs] == [
+        s.to_dict() for s in full_specs
+    ]
+    assert again.score == pytest.approx(trainer.best_full_score)
+
+
+def test_training_log_persists_curves_and_behavior(tmp_path) -> None:
+    trainer = _trainer(
+        tmp_path,
+        horizon=2,
+        num_simulations=2,
+        min_replay_transitions_before_training=2,
+        learner_updates_per_iteration=1,
+        max_env_steps=6,
+        eval_every_env_steps=6,
+        checkpoint_every_env_steps=6,
+    )
+    trainer.train()
+    path = trainer.write_training_log()
+    assert path.exists()
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == len(trainer.training_log) + 1  # header + one row per iteration
+    header = lines[0].split(",")
+    for key in (
+        "env_steps",
+        "gradient_updates",
+        "train_total_loss",
+        "train_reward_mae",
+        "train_value_mae",
+        "train_policy_kl",
+        "search_search_changed_argmax_fraction",
+        "search_root_visit_entropy_mean",
+        "staleness_mean_staleness",
+        "replay_trajectories",
+        "sampled_positions",
+        "sampled_action_0_fraction",
+        "replay_event_pct_hold",
+    ):
+        assert key in header, key
+    # Per-unroll-step diagnostics are persisted too (S30-S32).
+    assert "train_k0_value_mae" in header
+    assert "train_k1_reward_mae" in header
+    assert "train_latent_k0_norm" in header
+    assert report_log_has_rows(trainer.training_log)
+
+
+def report_log_has_rows(rows: list[dict]) -> bool:
+    return all(row.get("env_steps") for row in rows)
+
+
+def test_non_finite_metric_aborts_the_run(tmp_path, monkeypatch) -> None:
+    trainer = _trainer(
+        tmp_path,
+        horizon=2,
+        num_simulations=2,
+        min_replay_transitions_before_training=2,
+        learner_updates_per_iteration=1,
+        max_env_steps=6,
+        eval_every_env_steps=10_000,
+        checkpoint_every_env_steps=10_000,
+    )
+
+    def explode(updates: int | None = None):
+        del updates
+        return [{"total_loss": float("nan"), "reward_mae": 0.0}], {}
+
+    monkeypatch.setattr(trainer, "learn_phase", explode)
+    with pytest.raises(NumericalCorruptionError, match="non-finite"):
+        trainer.run_iteration()
+
+
+def test_replay_backend_is_configurable_and_logged(tmp_path) -> None:
+    trainer = _trainer(
+        tmp_path,
+        horizon=2,
+        num_simulations=2,
+        min_replay_transitions_before_training=2,
+        learner_updates_per_iteration=1,
+        max_env_steps=4,
+        eval_every_env_steps=10_000,
+        checkpoint_every_env_steps=10_000,
+        batch_backend="reference",
+    )
+    trainer.run_iteration()
+    trainer.run_iteration()
+    row = trainer.training_log[-1]
+    assert row["replay_batch_backend"] == "reference"
+    assert row["sampled_positions"] > 0.0

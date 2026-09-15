@@ -383,6 +383,46 @@ def _diagnostics(
                     ),
                 }
             )
+        # Per-unroll-step quality (Stage 4.7 S30-S32): does the learned latent
+        # model degrade as the recurrent unroll gets deeper?
+        for step in range(int(value_target.shape[1])):
+            prefix = f"k{step}_"
+            mask = value_masks[:, step] if value_masks.ndim > 1 else value_masks
+            value_step_err = (value_pred[:, step] - value_target[:, step]).abs()
+            value_step_sq = (value_pred[:, step] - value_target[:, step]) ** 2
+            diagnostics[prefix + "value_mae"] = float(
+                _masked_mean(value_step_err.reshape(-1), mask).item()
+            )
+            diagnostics[prefix + "value_rmse"] = float(
+                _masked_mean(value_step_sq.reshape(-1), mask).sqrt().item()
+            )
+            policy_mask_step = policy_masks[:, step]
+            diagnostics[prefix + "policy_kl"] = float(
+                _masked_mean(_kl(target[:, step], log_probs[:, step]), policy_mask_step).item()
+            )
+            diagnostics[prefix + "policy_entropy"] = float(
+                _masked_mean(_entropy(probs[:, step]), policy_mask_step).item()
+            )
+            diagnostics[prefix + "target_policy_entropy"] = float(
+                _masked_mean(_entropy(target[:, step]), policy_mask_step).item()
+            )
+            agreement_step = (probs[:, step].argmax(dim=-1) == target[:, step].argmax(dim=-1)).to(
+                probs.dtype
+            )
+            diagnostics[prefix + "policy_top1_agreement"] = float(
+                _masked_mean(agreement_step, policy_mask_step).item()
+            )
+        for step in range(int(batch.target_rewards.shape[1])):
+            prefix = f"k{step}_"
+            reward_step_err = (prediction.reward[:, step] - batch.target_rewards[:, step]).abs()
+            reward_step_sq = (prediction.reward[:, step] - batch.target_rewards[:, step]) ** 2
+            mask = reward_masks[:, step]
+            diagnostics[prefix + "reward_mae"] = float(
+                _masked_mean(reward_step_err.reshape(-1), mask).item()
+            )
+            diagnostics[prefix + "reward_rmse"] = float(
+                _masked_mean(reward_step_sq.reshape(-1), mask).sqrt().item()
+            )
         if prediction.latents:
             for index, latent in enumerate(prediction.latents):
                 detached = latent.detach()
