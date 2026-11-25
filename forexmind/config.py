@@ -1,4 +1,4 @@
-"""Central configuration for the ForexMind simulator.
+"""Central configuration for the simulator.
 
 All execution, margin, reward, and environment assumptions are explicit and
 configuration-driven.  Nothing here is derived from the historical OHLC data;
