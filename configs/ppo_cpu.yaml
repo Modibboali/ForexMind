@@ -1,0 +1,76 @@
+# ForexMind Phase 3 — PPO training config for a dedicated multi-CPU machine.
+# PPO is on-policy: workers are re-synced with the current policy every
+# collection round, so collect_batch also defines the rollout size.
+# Launch with:
+#   python -m forexmind.training.train_ppo --config configs/ppo_cpu.yaml --seeds 1 2 3 4 5
+algorithm:
+  name: ppo
+
+model:
+  hidden_dim: 256
+  num_layers: 2
+  activation: relu
+
+training:
+  total_env_steps: 5000000
+  batch_size: 256
+  replay_capacity: 0
+  warmup_steps: 0
+  gradient_updates_per_step: 1
+  collect_batch: 4096
+  gamma: 0.99
+  tau: 0.005
+  learning_rate: 0.0003
+  alpha: auto
+  ppo_epochs: 10
+  ppo_clip_epsilon: 0.2
+  ppo_entropy_coef: 0.01
+  ppo_value_coef: 0.5
+  gae_lambda: 0.95
+  policy_sync_interval: 0
+
+environment:
+  split: train
+  context_length: 64
+  horizon: 512
+  initial_balance: "10000"
+  leverage: 50.0
+  spread: 0.0002
+  commission: 0.0
+  sizing_mode: equity_fraction
+  account_currency: USD
+  instrument_spreads:
+    EURUSD: 0.0002
+    GBPUSD: 0.0002
+    USDJPY: 0.02
+    USDCHF: 0.0002
+    AUDUSD: 0.0002
+    USDCAD: 0.0002
+    NZDUSD: 0.0002
+  instruments: []
+
+compute:
+  num_workers: 200
+  learner_device: cpu
+  torch_threads: 2
+  collect_backend: process
+  seed: 42
+
+logging:
+  log_every_env_steps: 500000
+  evaluate_every_env_steps: 2000000
+  checkpoint_every_env_steps: 2000000
+  run_dir: runs
+
+evaluation:
+  validation_episodes: 100
+  test_episodes: 100
+  eval_horizon: 512
+  eval_seed: 42
+
+selection:
+  metric: mean_episode_log_return
+  lambda_drawdown: 1.0
+
+run_id: ppo_cpu
+dataset_version: processed-parquet-2026

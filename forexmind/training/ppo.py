@@ -1,0 +1,646 @@
+"""Masked categorical PPO; clipped objective and trajectory-isolated GAE."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.optim import Adam
+
+from forexmind.training.action_diagnostics import ActionDiagnostics
+from forexmind.training.collector import Transition
+from forexmind.training.config import ExperimentConfig
+from forexmind.training.networks import CategoricalPolicy, ValueNet
+from forexmind.training.numerics import (
+    assert_finite,
+    grad_norm_stats,
+    parameter_stats,
+    tensor_stats,
+)
+from forexmind.training.trainer import BaseTrainer
+
+# Numerically-safe band for ``log(new_prob / old_prob)`` before ``exp``.
+# PPO's clip (``ppo_clip_epsilon``) makes ratios beyond ~1 +/- eps equivalent
+# in the objective, so clamping the *log* ratio to +/-10 (ratio in
+# [4.5e-5, 2.2e4]) only prevents ``exp`` overflow -> inf -> NaN and does not
+# change the clipped objective.
+LOG_RATIO_CLAMP = 10.0
+
+
+class PPOTrainer(BaseTrainer):
+    def __init__(
+        self,
+        config: ExperimentConfig,
+        run_dir: str | Path,
+        *,
+        dataset: Any = None,
+    ) -> None:
+        super().__init__(config, run_dir, dataset=dataset)
+        model = config.model
+        self.actor = CategoricalPolicy(self.obs_dim, model)
+        self._value_net = ValueNet(self.obs_dim, model)
+        self.actor.to(self.device)
+        self._value_net.to(self.device)
+        self.actor.eval()
+        self._value_net.eval()
+
+        actor_lr = config.training.actor_lr or config.training.learning_rate
+        critic_lr = config.training.critic_lr or config.training.learning_rate
+        self.actor_opt = Adam(self.actor.parameters(), lr=actor_lr)
+        self.value_opt = Adam(self._value_net.parameters(), lr=critic_lr)
+
+        self._rollout: list[Transition] = []
+        self._rng = np.random.default_rng(config.compute.seed)
+        self._finite_check = bool(config.training.finite_check)
+        self._adv_epsilon = float(config.training.adv_epsilon)
+        self._finite_alert_count = 0
+        self._nonfinite_total = 0
+        self._clip_warn_count = 0
+        self.action_diagnostics = ActionDiagnostics()
+        self.update_history: list[dict[str, float]] = []
+
+    # -- BaseTrainer interface ------------------------------------------------
+
+    def policy(self) -> nn.Module:
+        return self.actor
+
+    def value_net(self) -> nn.Module | None:
+        return self._value_net
+
+    def replay_size(self) -> int:
+        return len(self._rollout)
+
+    def _consume_transitions(self, transitions: list[Transition]) -> None:
+        for t in transitions:
+            if t.trading_info is not None:
+                self.action_diagnostics.record(
+                    int(t.action),
+                    t.trading_info,
+                    worker=t.worker_id,
+                    episode=t.trajectory_id,
+                    step=t.trajectory_step,
+                    done=t.terminated or t.truncated,
+                )
+        self._rollout.extend(transitions)
+        if len(self._rollout) < self.config.training.collect_batch:
+            return
+        diag = self.update()
+        self._gradient_updates += 1
+        self._record_diagnostics(diag)
+        self._rollout.clear()
+
+    def _maybe_resync_policy(self) -> None:
+        # PPO is on-policy: workers must act with the updated policy every round.
+        self._sync_policy_to_workers()
+
+    # -- first-non-finite diagnostics -----------------------------------------
+
+    def _context_for(self, index: int | None) -> dict[str, object]:
+        ctx: dict[str, object] = {
+            "gradient_updates": self._gradient_updates,
+            "env_steps": self._env_steps,
+            "instrument": "",
+            "timestamp": "",
+        }
+        if index is not None and 0 <= index < len(self._rollout):
+            t = self._rollout[index]
+            ctx["instrument"] = t.instrument
+            ctx["timestamp"] = str(t.timestamp) if t.timestamp is not None else ""
+        return ctx
+
+    def _check_first_nonfinite(self, name: str, value: Any, *, dim: int | None = None) -> bool:
+        """Return True when ``value`` contains a non-finite entry.
+
+        In ``finite_check`` mode the first detection raises :class:`FiniteError`
+        with instrument/timestamp context.  Otherwise it is logged (a few
+        alerts per run) and counted in ``_nonfinite_total``.
+        """
+        stats = tensor_stats(value)
+        if int(stats["finite_count"]) == int(stats["total_count"]):
+            return False
+        from forexmind.training.numerics import first_nonfinite_index
+
+        flat = first_nonfinite_index(value)
+        row = (flat // dim) if (dim and dim is not None and dim > 0 and flat is not None) else flat
+        ctx = self._context_for(row)
+        if self._finite_check:
+            assert_finite(name, value, context=ctx, strict=True)
+        elif self._finite_alert_count < 20:
+            self._finite_alert_count += 1
+            assert_finite(name, value, context=ctx, strict=False)
+        self._nonfinite_total += 1
+        return True
+
+    def _check_grads_finite(self, module: nn.Module, label: str) -> None:
+        for pname, p in module.named_parameters():
+            if p.grad is None:
+                continue
+            if self._check_first_nonfinite(f"{label}.{pname}.grad", p.grad, dim=None):
+                break
+
+    def _check_params_finite(self, module: nn.Module, label: str) -> None:
+        for pname, p in module.named_parameters():
+            if self._check_first_nonfinite(f"{label}.{pname}.param", p, dim=None):
+                break
+
+    def _all_params(self) -> list[nn.Parameter]:
+        return [p for p in self.actor.parameters()] + [p for p in self._value_net.parameters()]
+
+    def _param_update_magnitude(self, params_before: list[torch.Tensor]) -> tuple[float, float]:
+        """Mean/max absolute parameter change over this rollout update."""
+        deltas = [
+            p.detach().sub(pb) for p, pb in zip(self._all_params(), params_before, strict=True)
+        ]
+        flat = torch.cat([d.ravel() for d in deltas])
+        if flat.numel() == 0:
+            return 0.0, 0.0
+        return float(flat.abs().mean().item()), float(flat.abs().max().item())
+
+    def _minibatch_actor(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        old_logp: torch.Tensor,
+        adv: torch.Tensor,
+        *,
+        action_mask: torch.Tensor,
+        eps: float,
+        ent_coef: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float, float, torch.Tensor]:
+        """Evaluate the integer action using its original sampling mask."""
+        new_logp, entropy = self.actor.evaluate(obs, action, action_mask)
+
+        log_ratio = (new_logp - old_logp).clamp(-LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
+        ratio = log_ratio.exp()
+        approx_kl = float((0.5 * (ratio - 1.0).pow(2)).mean().item())
+        approx_kl_log = float(((ratio - 1.0) - log_ratio).mean().item())
+        clip_frac = float(((ratio - 1.0).abs() > eps).float().mean().item())
+        entropy_mean = entropy.mean()
+
+        surr1 = ratio * adv
+        surr2 = ratio.clamp(1.0 - eps, 1.0 + eps) * adv
+        actor_loss = -(torch.min(surr1, surr2).mean() + ent_coef * entropy_mean)
+        return actor_loss, ratio, approx_kl, approx_kl_log, clip_frac, entropy_mean
+
+    # -- GAE ------------------------------------------------------------------
+
+    def _compute_gae(
+        self,
+        rew: np.ndarray,
+        done: np.ndarray,
+        val: np.ndarray,
+        next_val: np.ndarray,
+        *,
+        bootstrap_mask: np.ndarray | None = None,
+        segment_ids: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Raw GAE recurrence (pre-normalization), exposed for hand-computed tests.
+
+        ``done`` marks *terminated* episodes only.  Truncated time-limit
+        transitions bootstrap by default, but the recurrence never carries
+        across a changed ``segment_id``.  PPO passes one segment per
+        worker/trajectory fragment so advantages cannot cross workers,
+        episodes, or collection-round boundaries.
+        """
+        n = len(rew)
+        gamma = self.config.training.gamma
+        lam = self.config.training.gae_lambda
+        if bootstrap_mask is None:
+            bootstrap_mask = ~np.asarray(done, dtype=bool)
+        else:
+            bootstrap_mask = np.asarray(bootstrap_mask, dtype=bool)
+        if segment_ids is None:
+            segment_ids = np.zeros(n, dtype=np.int64)
+        else:
+            segment_ids = np.asarray(segment_ids)
+        same_length = (
+            len(done) == len(val) == len(next_val) == len(bootstrap_mask) == len(segment_ids) == n
+        )
+        if not same_length:
+            raise ValueError("GAE inputs must have identical length")
+        adv = np.zeros(n, dtype=np.float32)
+        last = 0.0
+        for i in range(n - 1, -1, -1):
+            mask = bool(bootstrap_mask[i])
+            v_next = float(next_val[i]) if mask else 0.0
+            delta = float(rew[i]) + gamma * v_next - float(val[i])
+            carries_within_segment = i + 1 < n and segment_ids[i + 1] == segment_ids[i]
+            carry = mask and carries_within_segment
+            last = delta + gamma * lam * (1.0 if carry else 0.0) * last
+            adv[i] = last
+        returns = (adv + np.asarray(val, dtype=np.float32)).astype(np.float32)
+        return adv.astype(np.float32), returns
+
+    def _gae(
+        self,
+        rew: np.ndarray,
+        done: np.ndarray,
+        val: np.ndarray,
+        next_val: np.ndarray,
+        *,
+        bootstrap_mask: np.ndarray | None = None,
+        segment_ids: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Generalized advantage estimation with finite-std normalization."""
+        adv, returns = self._compute_gae(
+            rew,
+            done,
+            val,
+            next_val,
+            bootstrap_mask=bootstrap_mask,
+            segment_ids=segment_ids,
+        )
+        # Advantage normalization A = (A - mu) / (sigma + eps).
+        std = float(adv.std())
+        if np.isfinite(std) and std > self._adv_epsilon:
+            adv = (adv - adv.mean()) / (std + self._adv_epsilon)
+        elif np.isfinite(std):
+            # Degenerate batch (all advantages identical): zero signal.
+            adv = np.zeros_like(adv)
+        # If std is non-finite the caller's finite check reports it.
+        return adv.astype(np.float32), returns
+
+    def _rollout_segment_key(self, t: Transition) -> tuple[int, int, int]:
+        return (int(t.rollout_fragment_id), int(t.worker_id), int(t.trajectory_id))
+
+    def _validate_rollout_integrity(
+        self,
+        rollout: list[Transition],
+        *,
+        advantages: np.ndarray | None = None,
+        returns: np.ndarray | None = None,
+    ) -> dict[str, float]:
+        if not rollout:
+            return {}
+        groups: dict[tuple[int, int, int], list[tuple[int, Transition]]] = {}
+        for i, t in enumerate(rollout):
+            if int(t.worker_id) < 0:
+                raise ValueError(f"rollout transition {i} has invalid worker_id={t.worker_id}")
+            if int(t.trajectory_id) < 0:
+                raise ValueError(
+                    f"rollout transition {i} has invalid trajectory_id={t.trajectory_id}"
+                )
+            if int(t.trajectory_step) < 0:
+                raise ValueError(
+                    f"rollout transition {i} has invalid trajectory_step={t.trajectory_step}"
+                )
+            if int(t.rollout_fragment_id) < 0:
+                raise ValueError(
+                    "rollout transition "
+                    f"{i} has invalid rollout_fragment_id={t.rollout_fragment_id}"
+                )
+            groups.setdefault(self._rollout_segment_key(t), []).append((i, t))
+
+        sizes: list[int] = []
+        for key, items in groups.items():
+            ordered = sorted(items, key=lambda item: int(item[1].trajectory_step))
+            steps = [int(t.trajectory_step) for _, t in ordered]
+            if len(set(steps)) != len(steps):
+                raise ValueError(f"duplicate trajectory_step in rollout segment {key}: {steps}")
+            expected = list(range(steps[0], steps[0] + len(steps)))
+            if steps != expected:
+                raise ValueError(
+                    f"missing or corrupt trajectory_step in rollout segment {key}: "
+                    f"got {steps}, expected {expected}"
+                )
+            for _, t in ordered:
+                if self._rollout_segment_key(t) != key:
+                    raise ValueError("GAE segment crosses a worker/trajectory boundary")
+            sizes.append(len(items))
+
+        if advantages is not None:
+            self._check_first_nonfinite("advantages", advantages, dim=None)
+        if returns is not None:
+            self._check_first_nonfinite("returns", returns, dim=None)
+
+        completed = sum(1 for t in rollout if t.terminated or t.truncated)
+        return {
+            "unique_trajectories": float(len(groups)),
+            "rollout_completed_episodes": float(completed),
+            "worker_trajectory_size_min": float(min(sizes)),
+            "worker_trajectory_size_max": float(max(sizes)),
+            "worker_trajectory_size_mean": float(np.mean(sizes)),
+        }
+
+    def _gae_for_rollout(
+        self, rollout: list[Transition]
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+        n = len(rollout)
+        raw_adv = np.zeros(n, dtype=np.float32)
+        returns = np.zeros(n, dtype=np.float32)
+        groups: dict[tuple[int, int, int], list[tuple[int, Transition]]] = {}
+        for i, t in enumerate(rollout):
+            groups.setdefault(self._rollout_segment_key(t), []).append((i, t))
+
+        for key, items in groups.items():
+            ordered = sorted(items, key=lambda item: int(item[1].trajectory_step))
+            idx = [i for i, _ in ordered]
+            seg = [t for _, t in ordered]
+            rew = np.asarray([t.reward for t in seg], dtype=np.float32)
+            done = np.asarray([t.terminated for t in seg], dtype=bool)
+            val = np.asarray([t.value for t in seg], dtype=np.float32)
+            next_val = np.asarray([t.next_value for t in seg], dtype=np.float32)
+            bootstrap = np.asarray(
+                [
+                    (not t.terminated) if t.next_bootstrap is None else bool(t.next_bootstrap)
+                    for t in seg
+                ],
+                dtype=bool,
+            )
+            segment_ids = np.full(len(seg), hash(key), dtype=np.int64)
+            adv_seg, ret_seg = self._compute_gae(
+                rew,
+                done,
+                val,
+                next_val,
+                bootstrap_mask=bootstrap,
+                segment_ids=segment_ids,
+            )
+            raw_adv[idx] = adv_seg
+            returns[idx] = ret_seg
+
+        std = float(raw_adv.std())
+        if np.isfinite(std) and std > self._adv_epsilon:
+            adv = (raw_adv - raw_adv.mean()) / (std + self._adv_epsilon)
+        elif np.isfinite(std):
+            adv = np.zeros_like(raw_adv)
+        else:
+            adv = raw_adv
+        integrity = self._validate_rollout_integrity(rollout, advantages=adv, returns=returns)
+        return adv.astype(np.float32), returns.astype(np.float32), integrity
+
+    # -- PPO update -----------------------------------------------------------
+
+    def update(self) -> dict[str, float]:
+        rollout = self._rollout
+        n = len(rollout)
+        if n == 0:
+            return {}
+        obs = np.stack([t.obs for t in rollout]).astype(np.float32)
+        next_obs = np.stack([t.next_obs for t in rollout]).astype(np.float32)
+        act = np.asarray([t.action for t in rollout], dtype=np.int64)
+        rew = np.asarray([t.reward for t in rollout], dtype=np.float32)
+        old_logp = np.asarray([t.log_prob for t in rollout], dtype=np.float32).reshape(-1, 1)
+        val = np.asarray([t.value for t in rollout], dtype=np.float32)
+        next_val = np.asarray([t.next_value for t in rollout], dtype=np.float32)
+
+        # -- stage 1: validate the pipeline in documented order ---------------
+        self._check_first_nonfinite("observation", obs, dim=obs.shape[1])
+        self._check_first_nonfinite("next_observation", next_obs, dim=next_obs.shape[1])
+        self._check_first_nonfinite("action", act, dim=1)
+        self._check_first_nonfinite("reward", rew, dim=None)
+        self._check_first_nonfinite("value_prediction", val, dim=None)
+        self._check_first_nonfinite("next_value_prediction", next_val, dim=None)
+        self._check_first_nonfinite("old_log_prob", old_logp, dim=1)
+
+        rew_stats = tensor_stats(rew)
+        adv, returns, integrity = self._gae_for_rollout(rollout)
+        self._check_first_nonfinite("returns", returns, dim=None)
+        self._check_first_nonfinite("normalized_advantages", adv, dim=None)
+        ret_stats = tensor_stats(returns)
+        adv_stats = tensor_stats(adv)
+
+        # -- stage 2: tensors -------------------------------------------------
+        obs_t = torch.as_tensor(obs, device=self.device)
+        if any(
+            t.action_mask is None or not isinstance(t.action, (int, np.integer)) for t in rollout
+        ):
+            raise ValueError("PPO transitions require integer actions and original action masks")
+        masks = np.stack([cast(np.ndarray, t.action_mask) for t in rollout]).astype(bool)
+        act_t = torch.as_tensor(act, dtype=torch.long, device=self.device)
+        mask_t = torch.as_tensor(masks, dtype=torch.bool, device=self.device)
+        old_logp_t = torch.as_tensor(old_logp, device=self.device)
+        with torch.no_grad():
+            initial_logp, _ = self.actor.evaluate(obs_t, act_t, mask_t)
+            initial_ratio_error = float(((initial_logp - old_logp_t).exp() - 1).abs().max())
+        adv_t = torch.as_tensor(adv, device=self.device).unsqueeze(1)
+        ret_t = torch.as_tensor(returns, device=self.device).unsqueeze(1)
+
+        cfg = self.config.training
+        eps = cfg.ppo_clip_epsilon
+        ent_coef = cfg.ppo_entropy_coef
+        val_coef = cfg.ppo_value_coef
+        batch = cfg.batch_size
+        max_grad_norm = float(cfg.max_grad_norm)
+        target_kl = float(cfg.ppo_target_kl or 0.0)
+
+        params_before = [p.detach().clone() for p in self._all_params()]
+
+        total_actor = 0.0
+        total_value = 0.0
+        total_entropy = 0.0
+        total_kl = 0.0
+        total_kl_log = 0.0
+        total_clip = 0.0
+        actor_grad_norm = 0.0
+        critic_grad_norm = 0.0
+        actor_param_max = 0.0
+        critic_param_max = 0.0
+        n_batches = 0
+        early_stop_kl = False
+        kl_stop_epoch = 0
+        high_clip = False
+        for epoch in range(cfg.ppo_epochs):
+            epoch_kl_log = 0.0
+            epoch_batches = 0
+            perm = self._rng.permutation(n)
+            for start in range(0, n, batch):
+                idx = perm[start : start + batch]
+
+                # -- actor output stability ------------------------------------
+                self._check_first_nonfinite("actor_logits", self.actor(obs_t[idx]), dim=None)
+
+                actor_loss, _ratio, approx_kl, approx_kl_log, clip_frac, entropy = (
+                    self._minibatch_actor(
+                        obs_t[idx],
+                        act_t[idx],
+                        old_logp_t[idx],
+                        adv_t[idx],
+                        action_mask=mask_t[idx],
+                        eps=eps,
+                        ent_coef=ent_coef,
+                    )
+                )
+
+                # -- value loss -------------------------------------------------
+                value_pred = self._value_net(obs_t[idx])
+                value_loss = F.mse_loss(value_pred, ret_t[idx])
+                loss = actor_loss + val_coef * value_loss
+                self._check_first_nonfinite("actor_loss", actor_loss, dim=None)
+                self._check_first_nonfinite("value_loss", value_loss, dim=None)
+                self._check_first_nonfinite("total_loss", loss, dim=None)
+
+                # -- backward + gradient diagnostics + clipping ----------------
+                self.actor_opt.zero_grad(set_to_none=True)
+                self.value_opt.zero_grad(set_to_none=True)
+                loss.backward()
+                self._check_grads_finite(self.actor, "actor")
+                self._check_grads_finite(self._value_net, "critic")
+                if max_grad_norm and max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self._value_net.parameters(), max_grad_norm)
+                self.actor_opt.step()
+                self.value_opt.step()
+
+                # -- parameter diagnostics --------------------------------------
+                actor_grad_norm = max(actor_grad_norm, grad_norm_stats(self.actor)["grad_norm"])
+                critic_grad_norm = max(
+                    critic_grad_norm, grad_norm_stats(self._value_net)["grad_norm"]
+                )
+                a_params = parameter_stats(self.actor)
+                c_params = parameter_stats(self._value_net)
+                actor_param_max = max(actor_param_max, a_params["max_abs_param"])
+                critic_param_max = max(critic_param_max, c_params["max_abs_param"])
+                if a_params["nan_params"] or a_params["inf_params"]:
+                    self._check_params_finite(self.actor, "actor")
+                if c_params["nan_params"] or c_params["inf_params"]:
+                    self._check_params_finite(self._value_net, "critic")
+
+                total_actor += float(actor_loss.item())
+                total_value += float(value_loss.item())
+                total_entropy += float(entropy.item())
+                total_kl += approx_kl
+                total_kl_log += approx_kl_log
+                total_clip += clip_frac
+                epoch_kl_log += approx_kl_log
+                epoch_batches += 1
+                n_batches += 1
+                if clip_frac > 0.95:
+                    high_clip = True
+
+            # -- target-KL early stopping for this rollout ---------------------
+            if target_kl > 0 and epoch_batches and (epoch_kl_log / epoch_batches) > target_kl:
+                early_stop_kl = True
+                kl_stop_epoch = epoch + 1
+                break
+
+        mean_abs_param_update, max_abs_param_update = self._param_update_magnitude(params_before)
+
+        if high_clip:
+            self._clip_warn_count += 1
+            if self._clip_warn_count in (1, 5, 10, 20, 50) or self._clip_warn_count % 100 == 0:
+                print(
+                    "[ppo] WARNING clip_fraction>0.95 in a minibatch "
+                    f"(env_steps={self._env_steps:,}, count={self._clip_warn_count})",
+                    flush=True,
+                )
+
+        diag = {
+            "initial_ratio_max_error": initial_ratio_error,
+            "invalid_actions_sampled": 0.0,
+            "nonfinite_total": float(self._nonfinite_total),
+            "actor_loss": total_actor / max(1, n_batches),
+            "critic_loss": total_value / max(1, n_batches),
+            "entropy": total_entropy / max(1, n_batches),
+            "approx_kl": total_kl / max(1, n_batches),
+            "approx_kl_log": total_kl_log / max(1, n_batches),
+            "clip_fraction": total_clip / max(1, n_batches),
+            "early_stop_kl": 1.0 if early_stop_kl else 0.0,
+            "kl_stop_epoch": float(kl_stop_epoch),
+            "high_clip_fraction": 1.0 if high_clip else 0.0,
+            "actor_grad_norm": actor_grad_norm,
+            "critic_grad_norm": critic_grad_norm,
+            "actor_param_max": actor_param_max,
+            "critic_param_max": critic_param_max,
+            "mean_abs_parameter_update": mean_abs_param_update,
+            "max_abs_parameter_update": max_abs_param_update,
+            "reward_min": rew_stats.get("min") or 0.0,
+            "reward_max": rew_stats.get("max") or 0.0,
+            "reward_mean": rew_stats.get("mean") or 0.0,
+            "reward_std": rew_stats.get("std") or 0.0,
+            "return_min": ret_stats.get("min") or 0.0,
+            "return_max": ret_stats.get("max") or 0.0,
+            "rollout_transitions": float(n),
+            "advantage_mean": adv_stats.get("mean") or 0.0,
+            "advantage_std": adv_stats.get("std") or 0.0,
+            "advantage_min": adv_stats.get("min") or 0.0,
+            "advantage_max": adv_stats.get("max") or 0.0,
+            "alpha": 0.0,
+            "alpha_loss": 0.0,
+            "q1": float(np.mean(val)),
+            "q2": 0.0,
+        }
+        diag.update(integrity)
+        diag.update(self.action_diagnostics.summary())
+        self._last_diag = diag
+        return diag
+
+    def _progress_postfix(self) -> dict[str, object]:
+        d = getattr(self, "_last_diag", {})
+        return {
+            k: f"{d[k]:+.4f}"
+            for k in ("entropy", "actor_loss", "approx_kl", "clip_fraction")
+            if k in d
+        }
+
+    def _record_diagnostics(self, diag: dict[str, float]) -> None:
+        super()._record_diagnostics(diag)
+        self.update_history.append(dict(diag))
+
+    def _collect_warnings(self) -> list[str]:
+        stats = self.action_diagnostics.summary()
+        messages = []
+        for action in ("hold", "flat"):
+            if stats[f"pct_{action}"] > 90:
+                messages.append(f"Learned behavior: mostly {action.upper()}")
+        if stats["pct_long_100"] + stats["pct_short_100"] > 90:
+            messages.append("Learned behavior: mostly LONG_100/SHORT_100")
+        return messages
+
+    def finalize(self) -> dict[str, Any]:
+        import json
+
+        summary = super().finalize()
+        summary["action_diagnostics"] = self.action_diagnostics.summary()
+        (self.run_dir / "training_summary.json").write_text(
+            json.dumps(summary, indent=2, default=str), encoding="utf-8"
+        )
+        (self.run_dir / "ppo_updates.json").write_text(
+            json.dumps(self.update_history, indent=2), encoding="utf-8"
+        )
+        return summary
+
+    # -- checkpointing --------------------------------------------------------
+
+    def state_dicts(self) -> dict[str, Any]:
+        return {
+            "critics": {"critic": self._value_net.state_dict()},
+            "targets": {},
+            "optimizers": {
+                "actor_opt": self.actor_opt.state_dict(),
+                "value_opt": self.value_opt.state_dict(),
+            },
+            "log_alpha": None,
+            "replay_meta": {},
+        }
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        if state.get("policy"):
+            self.actor.load_state_dict({k: torch.as_tensor(v) for k, v in state["policy"].items()})
+        critics = state.get("critics", {}) or {}
+        if critics.get("critic"):
+            self._value_net.load_state_dict(
+                {k: torch.as_tensor(v) for k, v in critics["critic"].items()}
+            )
+        opts = state.get("optimizers", {}) or {}
+        if opts.get("actor_opt"):
+            self.actor_opt.load_state_dict(opts["actor_opt"])
+        if opts.get("value_opt"):
+            self.value_opt.load_state_dict(opts["value_opt"])
+
+    def _local_rng_state(self) -> dict[str, Any]:
+        return {
+            "ppo_minibatch_rng": self._rng.bit_generator.state,
+            "action_diagnostics": self.action_diagnostics.state_dict(),
+            "update_history": self.update_history,
+        }
+
+    def _load_local_rng_state(self, state: dict[str, Any]) -> None:
+        self.action_diagnostics.load_state_dict(state.get("action_diagnostics", {}))
+        self.update_history = list(state.get("update_history", []))
+        if state.get("ppo_minibatch_rng"):
+            self._rng.bit_generator.state = state["ppo_minibatch_rng"]

@@ -1,0 +1,71 @@
+"""ForexMind evaluation layer: runner, metrics, aggregation, report."""
+
+from forexmind.evaluation.aggregation import (
+    aggregate_across_instruments,
+    mean_log_return_series,
+    per_period_log_returns,
+    per_period_report,
+)
+from forexmind.evaluation.metrics import (
+    TradeStats,
+    annualized_return,
+    annualized_volatility,
+    average_drawdown,
+    calmar_ratio,
+    compute_metrics,
+    compute_series_metrics,
+    cumulative_log_return,
+    downside_deviation,
+    estimate_periods_per_year,
+    max_drawdown,
+    max_drawdown_pct,
+    per_period_volatility,
+    sharpe_ratio,
+    sortino_ratio,
+    total_return,
+    trade_statistics,
+)
+from forexmind.evaluation.report import (
+    build_report,
+    env_config_to_dict,
+    human_summary,
+    write_report,
+)
+from forexmind.evaluation.runner import (
+    AgentEvaluation,
+    EvaluationConfig,
+    EvaluationRunner,
+    evaluate,
+)
+
+__all__ = [
+    "AgentEvaluation",
+    "EvaluationConfig",
+    "EvaluationRunner",
+    "TradeStats",
+    "aggregate_across_instruments",
+    "annualized_return",
+    "annualized_volatility",
+    "average_drawdown",
+    "build_report",
+    "calmar_ratio",
+    "compute_metrics",
+    "compute_series_metrics",
+    "cumulative_log_return",
+    "downside_deviation",
+    "env_config_to_dict",
+    "estimate_periods_per_year",
+    "evaluate",
+    "human_summary",
+    "max_drawdown",
+    "max_drawdown_pct",
+    "mean_log_return_series",
+    "per_period_log_returns",
+    "per_period_report",
+    "per_period_volatility",
+    "sharpe_ratio",
+    "sortino_ratio",
+    "total_return",
+    "trade_statistics",
+    "write_report",
+]
