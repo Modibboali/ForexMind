@@ -20,7 +20,10 @@ from forexmind.observation.encoder import EncoderConfig
 from forexmind.observation.normalization import NormalizerConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw" / "historical_data"
+# The repository's raw files live with the Python data package.  Keep the
+# older root-level location as a fallback so local CSV exports still work.
+RAW_DATA_DIR = PROJECT_ROOT / "forexmind" / "data" / "raw" / "historical_data"
+LEGACY_RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw" / "historical_data"
 PROCESSED_DATA_DIR = PROJECT_ROOT / "data" / "processed"
 REPORTS_DIR = PROJECT_ROOT / "data" / "reports"
 
@@ -37,11 +40,29 @@ INSTRUMENTS: tuple[str, ...] = (
 
 
 def instrument_files(instrument: str) -> list[Path]:
-    """Return the sorted raw source files for one instrument."""
-    d = RAW_DATA_DIR / instrument.upper()
-    if not d.is_dir():
-        raise FileNotFoundError(f"no raw data directory for instrument {instrument}: {d}")
-    return sorted(d.glob("*.csv"))
+    """Return sorted raw CSV or Parquet files for one instrument.
+
+    The committed dataset is stored at ``forexmind/data/raw/historical_data``
+    and is Parquet-based.  The legacy root-level ``data/raw`` location is
+    still supported for older MT5 CSV exports.
+    """
+    key = instrument.upper()
+    candidates = (RAW_DATA_DIR / key, LEGACY_RAW_DATA_DIR / key)
+    for directory in candidates:
+        if not directory.is_dir():
+            continue
+        files = sorted(
+            path
+            for pattern in ("*.csv", "*.parquet", "*.pq")
+            for path in directory.glob(pattern)
+        )
+        if files:
+            return files
+
+    locations = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        f"no raw CSV/Parquet files for instrument {instrument}; checked: {locations}"
+    )
 
 
 def load_processed_instrument(instrument: str) -> InstrumentData:
